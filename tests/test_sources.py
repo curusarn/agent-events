@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import copy
+import os
+import unittest
+from unittest import mock
+
+from agent_events.sources import TopicError, parse
+from agent_events.sources.base import SourceError
+from agent_events.sources import github, linear, slack
+
+
+class ParseTests(unittest.TestCase):
+    def topic(self, raw):
+        source, parts = parse(raw)
+        return "/".join([source.type] + parts)
+
+    def test_github(self):
+        self.assertEqual(self.topic("github/Curusarn/Agent-Events/12"), "github/curusarn/agent-events/12")
+        self.assertEqual(self.topic("github/o/r/pull/12"), "github/o/r/12")
+        self.assertEqual(self.topic("https://github.com/o/r/pull/12/files#r1"), "github/o/r/12")
+        self.assertRaises(TopicError, parse, "github/o/r")
+        self.assertRaises(TopicError, parse, "github/o/r/abc")
+
+    def test_linear(self):
+        self.assertEqual(self.topic("linear/t-123"), "linear/T-123")
+        self.assertEqual(self.topic("linear/T-123/5C3BF24B"), "linear/T-123/5c3bf24b")
+        self.assertEqual(self.topic("https://linear.app/ws/issue/T-123/some-slug"), "linear/T-123")
+        self.assertEqual(self.topic("https://linear.app/ws/issue/T-123/some-slug#comment-5c3bf24b"),
+                         "linear/T-123/5c3bf24b")
+        self.assertRaises(TopicError, parse, "linear/123")
+
+    def test_slack(self):
+        self.assertEqual(self.topic("slack/c0123abcd"), "slack/C0123ABCD")
+        self.assertEqual(self.topic("slack/C0123ABCD/p1712345678123456"), "slack/C0123ABCD/1712345678.123456")
+        self.assertEqual(self.topic("https://x.slack.com/archives/C0123ABCD/p1712345678123456"),
+                         "slack/C0123ABCD/1712345678.123456")
+        self.assertEqual(self.topic("https://x.slack.com/archives/C0123ABCD/p1712345699000100"
+                                    "?thread_ts=1712345678.123456&cid=C0123ABCD"),
+                         "slack/C0123ABCD/1712345678.123456")
+        self.assertEqual(self.topic("https://x.slack.com/archives/C0123ABCD"), "slack/C0123ABCD")
+        self.assertRaises(TopicError, parse, "slack/C0123ABCD/notats")
+
+    def test_mc(self):
+        self.assertEqual(self.topic("hf/agent/0a1b2c3d4e"), "hf/agent/0a1b2c3d4e")
+        self.assertEqual(self.topic("/MC/Agent/Some_Id-1.x/"), "hf/agent/Some_Id-1.x")
+        self.assertEqual(self.topic("hf/thread/t1"), "hf/thread/t1")
+        self.assertTrue(parse("hf/agent/x")[0].push)
+        self.assertFalse(parse("github/o/r/1")[0].push)
+        for bad in ("mc/foo", "mc/foo/x", "hf/agent", "hf/agent/a b", "hf/agent/x/extra", "hf/agent/a:b"):
+            with self.assertRaises(TopicError, msg=bad) as cm:
+                parse(bad)
+            self.assertIn("hf/agent/<id>", str(cm.exception))
+
+    def test_unknown(self):
+        self.assertRaises(TopicError, parse, "https://example.com/x")
+        self.assertRaises(TopicError, parse, "jira/X-1")
+
+
+def gh_snapshot(**over):
+    s = {
+        "viewer": "me", "title": "Fix it", "url": "https://github.com/o/r/pull/1", "body": "desc",
+        "state": "OPEN", "draft": False, "base": "main", "head_ref": "fix", "mergeable": "MERGEABLE",
+        "review_decision": "REVIEW_REQUIRED", "author": "me", "merged_by": None,
+        "assignees": [], "labels": [], "reviewers": ["bob"], "head": "aaa",
+        "commits": [{"oid": "aaa", "headline": "first"}], "total_commits": 1,
+        "checks": {"test": {"s": "IN_PROGRESS", "url": "u"}}, "rollup": "PENDING",
+        "comments": {}, "reviews": {}, "threads": {},
+    }
+    s.update(over)
+    return s
+
+
+class GitHubDiffTests(unittest.TestCase):
+    def kinds(self, old, new):
+        return [(e.kind, e.summary) for e in github.diff(old, new, "github/o/r/1")]
+
+    def test_no_change_no_events(self):
+        self.assertEqual(self.kinds(gh_snapshot(), gh_snapshot()), [])
+
+    def test_ci(self):
+        old = gh_snapshot()
+        new = gh_snapshot(checks={"test": {"s": "FAILURE", "url": "u"}}, rollup="FAILURE")
+        self.assertEqual(self.kinds(old, new), [
+            ("check_failed", "check failed: test (failure)"),
+            ("checks", "CI failure: 0 passed, 1 failed, 1 total"),
+        ])
+        green = gh_snapshot(checks={"test": {"s": "SUCCESS", "url": "u"}}, rollup="SUCCESS")
+        self.assertEqual([k for k, _ in self.kinds(old, green)], ["checks"])
+
+    def test_push_and_force_push(self):
+        pushed = gh_snapshot(head="bbb", commits=[{"oid": "aaa", "headline": "first"},
+                                                   {"oid": "bbb", "headline": "second"}], total_commits=2)
+        self.assertEqual(self.kinds(gh_snapshot(), pushed)[0], ("push", "1 new commit pushed to fix"))
+        forced = gh_snapshot(head="ccc", commits=[{"oid": "ccc", "headline": "rewritten"}])
+        self.assertEqual(self.kinds(gh_snapshot(), forced)[0], ("push", "force-pushed (1 new commit)"))
+
+    def test_merge_and_meta(self):
+        new = gh_snapshot(state="MERGED", merged_by="bob", labels=["bug"], reviewers=[], title="Fix it now")
+        kinds = self.kinds(gh_snapshot(), new)
+        self.assertIn(("merged", "PR merged into main by @bob"), kinds)
+        self.assertIn(("labels", "label added: bug"), kinds)
+        self.assertIn(("reviewers", "review request removed: bob"), kinds)
+        self.assertIn(("title", "title changed: 'Fix it' → 'Fix it now'"), kinds)
+
+    def test_mergeable_unknown_is_carried_forward(self):
+        src = github.GitHub()
+        with mock.patch.object(github, "graphql"), mock.patch.object(github, "snapshot") as snap:
+            snap.return_value = gh_snapshot(mergeable="UNKNOWN")
+            r1 = src.poll(["o", "r", "1"], gh_snapshot(mergeable="MERGEABLE"))
+            self.assertEqual((r1.state["mergeable"], r1.events), ("MERGEABLE", []))
+            snap.return_value = gh_snapshot(mergeable="CONFLICTING")
+            r2 = src.poll(["o", "r", "1"], r1.state)
+            self.assertEqual([e.kind for e in r2.events], ["conflicts"])
+
+    def test_token_without_read_org_leaves_team_slugs_out(self):
+        src = github.GitHub()
+        pr = {"repository": {"pullRequest": {"number": 1}}}
+        denied = SourceError("The 'slug' field requires one of the following scopes: ['read:org', 'read:discussion']")
+        with mock.patch.object(github, "_no_read_org", False), mock.patch.object(github, "snapshot") as snap, \
+                mock.patch.object(github, "graphql", side_effect=[denied, pr, pr]) as gql:
+            snap.return_value = gh_snapshot()
+            src.poll(["o", "r", "1"], None)
+            src.poll(["o", "r", "1"], None)
+            queries = [c.args[0] for c in gql.call_args_list]
+            self.assertEqual(queries, [github.QUERY, github.NO_TEAM_QUERY, github.NO_TEAM_QUERY])
+            self.assertNotIn("Team", github.NO_TEAM_QUERY)
+
+    def test_old_comment_sliding_into_window_is_not_new(self):
+        old = gh_snapshot(comments={"C2": {"kind": "comment", "author": "a", "body": "x", "url": "u",
+                                           "updated": "t", "created": "2026-02-01"}})
+        new = gh_snapshot(comments={"C1": {"kind": "comment", "author": "a", "body": "old", "url": "u",
+                                           "updated": "t", "created": "2026-01-01"}})
+        self.assertEqual(self.kinds(old, new), [])
+
+    def test_comments_reviews_threads(self):
+        c = {"kind": "review_comment", "author": "bob", "body": "rename", "url": "u", "updated": "t1", "where": "a.py:3",
+             "created": "2026-10-05T10:45:00Z"}
+        old = gh_snapshot(threads={"T": {"resolved": False, "where": "a.py:3", "url": "u"}})
+        new = gh_snapshot(
+            comments={"C1": c, "C2": {"kind": "comment", "author": "me", "body": "done", "url": "u2", "updated": "t"}},
+            reviews={"R1": {"author": "bob", "state": "CHANGES_REQUESTED", "body": "pls", "url": "u", "updated": "t"},
+                     "R2": {"author": "bob", "state": "COMMENTED", "body": "", "url": "u", "updated": "t"}},
+            threads={"T": {"resolved": True, "where": "a.py:3", "url": "u"}})
+        events = github.diff(old, new, "github/o/r/1")
+        self.assertEqual([(e.kind, e.summary) for e in events], [
+            ("review_comment", "review comment on a.py:3 by @bob"),
+            ("comment", "comment by @me"),
+            ("review", "review by @bob: changes requested"),
+            ("thread", "review thread on a.py:3 resolved"),
+        ])
+        self.assertEqual([e.data.get("mine") for e in events[:2]], [False, True])
+        self.assertEqual(events[0].at, 1791197100.0)  # the comment's createdAt, not when we saw it
+        edited = copy.deepcopy(new)
+        edited["comments"]["C1"]["body"] = "rename it"
+        self.assertEqual(self.kinds(new, edited), [("review_comment_edited", "review comment on a.py:3 edited by @bob")])
+
+
+def lin_snapshot(**over):
+    s = {"viewer": "U1", "id": "x", "identifier": "T-1", "url": "https://linear.app/i/T-1", "title": "Task",
+         "description": "d", "state": "Todo", "assignee": None, "priority": "Low", "project": None, "cycle": None,
+         "estimate": None, "due": None, "parent": None, "labels": [], "comments": {}, "truncated": False}
+    s.update(over)
+    return s
+
+
+def lin_comment(parent=None, author="Ann", body="hi", author_id="U2"):
+    return {"parent": parent, "author": author, "author_id": author_id, "body": body,
+            "hash": linear.short_hash(body), "url": "u", "created": "t"}
+
+
+class LinearDiffTests(unittest.TestCase):
+    def test_fields_and_comment_threads(self):
+        root = "aaaaaaaa-1111"
+        old = lin_snapshot(comments={root: lin_comment()})
+        new = lin_snapshot(state="In Progress", assignee="Simon", labels=["bug"],
+                           comments={root: lin_comment(), "bbbbbbbb-2222": lin_comment(parent=root, author="Me", author_id="U1"),
+                                     "cccccccc-3333": dict(lin_comment(body="new thread"),
+                                                           created="2026-10-05T10:45:00.000Z")})
+        events = linear.diff(old, new, "linear/T-1")
+        self.assertEqual(events[-1].at, 1791197100.0)  # Majda's 10:45 comment is stamped 10:45
+        got = [(e.topic, e.summary, e.data.get("mine")) for e in events]
+        self.assertEqual(got, [
+            ("linear/T-1", "status: Todo → In Progress", None),
+            ("linear/T-1", "assignee: none → Simon", None),
+            ("linear/T-1", "label added: bug", None),
+            ("linear/T-1/aaaaaaaa", "reply by Me", True),
+            ("linear/T-1/cccccccc", "comment by Ann", False),
+        ])
+
+    def test_resolve_thread(self):
+        state = lin_snapshot(comments={"aaaaaaaa-1": lin_comment(), "bbbbbbbb-2": lin_comment(parent="aaaaaaaa-1")})
+        src = linear.Linear()
+        self.assertEqual(src.resolve(["T-1", "bbbbbbbb"], state)[0], ["T-1", "aaaaaaaa"])  # reply → its thread
+        self.assertRaises(TopicError, src.resolve, ["T-1", "ffffffff"], state)
+
+    def test_deleted_and_edited(self):
+        old = lin_snapshot(comments={"a": lin_comment(), "b": lin_comment(body="x")})
+        new = lin_snapshot(comments={"a": lin_comment(body="changed")})
+        kinds = [e.kind for e in linear.diff(old, new, "linear/T-1")]
+        self.assertEqual(kinds, ["comment_edited", "comment_deleted"])
+
+
+class SlackThreadTests(unittest.TestCase):
+    def setUp(self):
+        slack._team.update(url="https://ws.slack.com/", user_id="UME")
+        slack._users.update(UA="ann", UME="simon")
+        slack._channels["C1"] = "#dev"
+
+    def poll(self, messages, state):
+        with mock.patch.object(slack, "replies", return_value=messages):
+            return slack.poll_thread("C1", "100.000001", state)
+
+    def test_thread_changes(self):
+        root = {"ts": "100.000001", "user": "UA", "text": "question <@UME>?"}
+        base = self.poll([root], None)
+        self.assertEqual(base.events, [])
+        self.assertIn("question", base.summary)
+        reply = {"ts": "101.000001", "user": "UME", "text": "answer", "thread_ts": "100.000001"}
+        root2 = dict(root, reactions=[{"name": "eyes", "count": 1}])
+        r = self.poll([root2, reply], base.state)
+        got = [(e.kind, e.summary, e.data.get("mine")) for e in r.events]
+        self.assertEqual(got, [("reaction", ":eyes: added to message by ann", None),
+                               ("message", "reply by simon", True)])
+        self.assertEqual(r.events[1].dedupe, "msg:101.000001")
+        self.assertEqual(r.events[1].at, 101.000001)  # stamped with the message's own time
+        self.assertIn("thread_ts=100.000001", r.events[1].url)
+        edited = self.poll([root2, dict(reply, text="better answer")], r.state)
+        self.assertEqual([e.kind for e in edited.events], ["message_edited"])
+        deleted = self.poll([root2], edited.state)
+        self.assertEqual([e.kind for e in deleted.events], ["message_deleted"])
+
+    def test_channel_new_message_with_quick_reply(self):
+        state = {"latest": "100.000001", "threads": {}}
+        history = {"messages": [{"ts": "200.000001", "user": "UA", "text": "q", "reply_count": 1,
+                                 "latest_reply": "201.000001", "thread_ts": "200.000001"}]}
+        reply = [{"ts": "200.000001", "user": "UA", "text": "q"},
+                 {"ts": "201.000001", "user": "UME", "text": "a", "thread_ts": "200.000001"}]
+        with mock.patch.object(slack, "call", return_value=history), \
+                mock.patch.object(slack, "replies", return_value=reply):
+            r = slack.poll_channel("C1", state)
+        self.assertEqual([(e.topic, e.summary) for e in r.events], [
+            ("slack/C1", "message by ann in #dev"),
+            ("slack/C1/200.000001", "reply by simon in #dev thread"),
+        ])
+
+    def test_failed_channel_lookup_is_retried(self):
+        # A failed lookup shows the id but isn't kept for good: once Slack
+        # answers again, the name comes back (Simon, 2026-10-06).
+        slack._channels.pop("C9", None); slack._failed.pop("C9", None)
+        with mock.patch.object(slack, "call", side_effect=slack.SourceError("no token")):
+            self.assertEqual(slack.channel_name("C9"), "C9")
+        ok = {"channel": {"name": "engineering"}}
+        with mock.patch.object(slack, "call", return_value=ok) as call:
+            self.assertEqual(slack.channel_name("C9"), "C9")   # within the retry wait
+            call.assert_not_called()
+            with mock.patch.object(slack.time, "time", return_value=slack.time.time() + slack.RETRY_FAILED + 1):
+                self.assertEqual(slack.channel_name("C9"), "#engineering")
+        self.assertEqual(slack.channel_name("C9"), "#engineering")   # cached now
+
+    def test_render(self):
+        self.assertEqual(slack.render("hi <@UA> see <https://x.io|docs> in <#C1|dev> &amp; <!here>"),
+                         "hi @ann see docs (https://x.io) in #dev & @here")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SecretTests(unittest.TestCase):
+    def setUp(self):
+        from agent_events import config
+        self.config = config
+        config._secret_cache.clear()
+        config._secret_failed.clear()
+
+    def test_failed_op_read_is_not_retried_soon(self):
+        failed = mock.Mock(returncode=1, stdout="")
+        env = {"AGENT_EVENTS_X_OP_REF": "op://v/x/credential"}
+        with mock.patch.dict("os.environ", env), mock.patch("subprocess.run", return_value=failed) as run:
+            self.assertIsNone(self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None))
+            self.assertIsNone(self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None))
+            self.assertEqual(run.call_count, 1)  # the second lookup didn't prompt again
+            with mock.patch.object(self.config, "SECRET_RETRY", 0):
+                self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None)
+            self.assertEqual(run.call_count, 2)
+
+    def test_no_op_ref_means_no_op_read(self):
+        with mock.patch("subprocess.run") as run:
+            self.assertIsNone(self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF_UNSET", None))
+        run.assert_not_called()
+
+
+class CredentialDefaultsTest(unittest.TestCase):
+    """A fresh Mac: no token unless configured, read through Hyperfocus's op broker."""
+
+    def test_no_default_refs(self):
+        from agent_events.sources import linear, slack
+        self.assertIsNone(linear.DEFAULT_OP_REF)
+        self.assertIsNone(slack.DEFAULT_OP_REF)
+
+    def test_op_binary_prefers_the_hyperfocus_broker(self):
+        import tempfile
+        from unittest import mock
+        from agent_events import config
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(os.environ, {"HF_HOME": home}, clear=False):
+                os.environ.pop("AGENT_EVENTS_OP", None)
+                self.assertEqual(config.op_binary(), "op")
+                broker = os.path.join(home, "bin", "op")
+                os.makedirs(os.path.dirname(broker))
+                with open(broker, "w") as f:
+                    f.write("#!/bin/sh\n")
+                os.chmod(broker, 0o755)
+                self.assertEqual(config.op_binary(), broker)
+                with mock.patch.dict(os.environ, {"AGENT_EVENTS_OP": "/x/op"}):
+                    self.assertEqual(config.op_binary(), "/x/op")

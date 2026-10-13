@@ -1,0 +1,8 @@
+name: test
+on: [push, pull_request]
+jobs:
+  unittest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: PYTHONPATH=.:tests /usr/bin/python3 -m unittest discover -s tests -v

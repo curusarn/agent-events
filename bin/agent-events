@@ -1,0 +1,22 @@
+#!/bin/sh
+# Every Claude Code hook runs this, so it never goes through /usr/bin/python3: with Xcode selected
+# that is a shim that refuses to run until the Xcode license is accepted, and after the macOS 27
+# update every hook failed with it and no agent was woken for 36 min (2026-10-11 20:30). sh picks a
+# python3 that runs on its own; python (`python3 bin/agent-events`) reads these lines as a string.
+"""":
+for py in "$AGENT_EVENTS_PYTHON" /Library/Developer/CommandLineTools/usr/bin/python3 \
+          /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  [ -n "$py" ] && [ -x "$py" ] && exec "$py" "$0" "$@"
+done
+exec python3 "$0" "$@"
+"""
+"""Entry point; resolves symlinks so it works when linked into ~/.local/bin."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from agent_events.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
