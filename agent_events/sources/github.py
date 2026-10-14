@@ -66,7 +66,25 @@ NO_TEAM_QUERY = QUERY.replace(TEAM_SLUG, "")
 _no_read_org = False
 
 FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+PASSED = {"SUCCESS", "NEUTRAL", "SKIPPED", "STALE"}
 TERMINAL_ROLLUP = {"SUCCESS", "FAILURE", "ERROR"}
+# Checks that report nothing an agent should act on (e.g. a shadow CI run beside the real one):
+# no events, and left out of the pass/fail counts and the overall result. A regex on the name.
+IGNORE_CHECKS_ENV = "AGENT_EVENTS_IGNORE_CHECKS"
+IGNORE_CHECKS_DEFAULT = r"\(shadow\)"
+
+
+def counted(snap: dict) -> tuple[dict, str | None]:
+    """The checks that count, and the overall result without the ignored ones."""
+    pattern = os.environ.get(IGNORE_CHECKS_ENV, IGNORE_CHECKS_DEFAULT)
+    checks = {n: c for n, c in snap["checks"].items() if not (pattern and re.search(pattern, n))}
+    rollup = snap["rollup"]
+    if len(checks) == len(snap["checks"]) or rollup not in TERMINAL_ROLLUP:
+        return checks, rollup
+    states = [c["s"] for c in checks.values()]
+    if any(s in FAILED for s in states):
+        return checks, rollup
+    return checks, "SUCCESS" if all(s in PASSED for s in states) else "PENDING"
 URL_RE = re.compile(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/(\d+)", re.I)
 
 
@@ -207,15 +225,16 @@ def diff(old: dict, new: dict, topic: str) -> EventList:
                body=lines, url=f"{new['url']}/commits")
 
     same_head = old["head"] == new["head"]
-    for name, c in new["checks"].items():
-        prev = old["checks"].get(name) if same_head else None
+    (old_checks, old_rollup), (new_checks, new_rollup) = counted(old), counted(new)
+    for name, c in new_checks.items():
+        prev = old_checks.get(name) if same_head else None
         if c["s"] in FAILED and (prev is None or prev["s"] != c["s"]):
             ev.add("check_failed", f"check failed: {name} ({c['s'].lower()})", url=c.get("url") or "")
-    if new["rollup"] in TERMINAL_ROLLUP and (not same_head or old["rollup"] != new["rollup"]):
-        states = [c["s"] for c in new["checks"].values()]
+    if new_rollup in TERMINAL_ROLLUP and (not same_head or old_rollup != new_rollup):
+        states = [c["s"] for c in new_checks.values()]
         ok = sum(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states)
         bad = sum(s in FAILED for s in states)
-        ev.add("checks", f"CI {new['rollup'].lower()}: {ok} passed, {bad} failed, {len(states)} total",
+        ev.add("checks", f"CI {new_rollup.lower()}: {ok} passed, {bad} failed, {len(states)} total",
                url=f"{new['url']}/checks")
 
     def fresh(item: dict, old_items: dict) -> bool:

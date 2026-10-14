@@ -88,6 +88,22 @@ class GitHubDiffTests(unittest.TestCase):
         green = gh_snapshot(checks={"test": {"s": "SUCCESS", "url": "u"}}, rollup="SUCCESS")
         self.assertEqual([k for k, _ in self.kinds(old, green)], ["checks"])
 
+    def test_shadow_checks_are_ignored(self):
+        old = gh_snapshot(checks={"test": {"s": "IN_PROGRESS", "url": "u"},
+                                  "CI (shadow): test": {"s": "IN_PROGRESS", "url": "u"}})
+        # Only the shadow run failed: GitHub's rollup says failure, the PR's CI passed.
+        new = gh_snapshot(checks={"test": {"s": "SUCCESS", "url": "u"},
+                                  "CI (shadow): test": {"s": "FAILURE", "url": "u"}}, rollup="FAILURE")
+        self.assertEqual(self.kinds(old, new), [("checks", "CI success: 1 passed, 0 failed, 1 total")])
+        # The real check still running: no result yet.
+        running = gh_snapshot(checks={"test": {"s": "IN_PROGRESS", "url": "u"},
+                                      "CI (shadow): test": {"s": "FAILURE", "url": "u"}}, rollup="FAILURE")
+        self.assertEqual(self.kinds(old, running), [])
+        both = gh_snapshot(checks={"test": {"s": "FAILURE", "url": "u"},
+                                   "CI (shadow): test": {"s": "FAILURE", "url": "u"}}, rollup="FAILURE")
+        self.assertEqual(self.kinds(old, both), [("check_failed", "check failed: test (failure)"),
+                                                 ("checks", "CI failure: 0 passed, 1 failed, 1 total")])
+
     def test_push_and_force_push(self):
         pushed = gh_snapshot(head="bbb", commits=[{"oid": "aaa", "headline": "first"},
                                                    {"oid": "bbb", "headline": "second"}], total_commits=2)
