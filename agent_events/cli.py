@@ -500,7 +500,7 @@ def cmd_hook(args):
     daemon_down = False
     if event == "SessionStart":
         # After /clear (or a resume) the same Claude process continues as a different session
-        # id; tell the daemon so the previous session's subscriptions stop being polled.
+        # id; tell the daemon so the previous session's subscriptions move to this one.
         try:
             client.raw_request({"op": "session_start", "agent": agent, "pid": claude_pid()}, timeout=3)
         except (DaemonDown, OSError, ValueError):

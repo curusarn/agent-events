@@ -160,15 +160,28 @@ class WatchTests(DaemonTest):
             self.assertTrue(self.wait_for(lambda: self.daemon.store.pending("ag"), timeout=10))
             self.assertEqual([e["kind"] for e in watch_raw("ag")["events"]], ["recovered"])
 
-    def test_session_start_retires_previous_session_of_same_process(self):
+    def test_session_start_moves_subscriptions_of_previous_session_of_same_process(self):
+        """/clear (or a resume into another conversation): the same agent continues in a new
+        session id and keeps its subscriptions, filters included; each keeps its own inbox."""
         self.req(op="subscribe", agent="old", topic="fake/a", pid=os.getpid())
-        self.assertIn("fake/a", self.daemon.active_keys())
+        self.req(op="subscribe", agent="old", topic="fake/b", filter={"mine": True}, pid=os.getpid())
+        self.req(op="subscribe", agent="old", topic="hf/agent/x1", pid=os.getpid())
         r = self.req(op="session_start", agent="new", pid=os.getpid())
         self.assertEqual(r["retired"], ["old"])
-        self.assertNotIn("fake/a", self.daemon.active_keys())
-        self.assertEqual(len(self.req(op="list", agent="old")["subscriptions"]), 1)  # kept, just dormant
-        self.req(op="session_start", agent="old", pid=os.getpid() + 1)  # `claude --resume old`
+        self.assertEqual(sorted(r["moved"]), ["fake/a", "fake/b"])
+        new = {s["topic"]: s.get("filter") for s in self.req(op="list", agent="new")["subscriptions"]}
+        self.assertEqual(new, {"fake/a": None, "fake/b": {"mine": True}})
+        self.assertEqual([s["topic"] for s in self.req(op="list", agent="old")["subscriptions"]], ["hf/agent/x1"])
         self.assertIn("fake/a", self.daemon.active_keys())
+
+    def test_agents_stopped_for_a_week_keep_their_subscriptions(self):
+        self.req(op="subscribe", agent="ag", topic="fake/a")
+        self.daemon.store.x("UPDATE agents SET last_seen = ?, pid = NULL", (time.time() - 8 * 86400,))
+        self.daemon.maintenance()
+        self.assertEqual(len(self.daemon.store.subs("ag")), 1)
+        self.daemon.store.x("UPDATE agents SET last_seen = ?", (time.time() - 31 * 86400,))
+        self.daemon.maintenance()
+        self.assertEqual(self.daemon.store.subs("ag"), [])
 
     def test_stopped_agents_are_still_polled(self):
         """A stopped agent (no process, not seen for hours) keeps getting its events, stamped with

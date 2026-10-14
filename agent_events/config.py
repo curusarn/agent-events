@@ -61,8 +61,9 @@ def poll_interval(source_type: str, default: float) -> float:
 # An agent counts as alive (its topics get polled) while it has a watch connected, its
 # Claude Code process is running, or it talked to the daemon within this window.
 AGENT_IDLE = _float_env("AGENT_EVENTS_AGENT_IDLE", 3600)
-# Subscriptions of agents that are gone for this long are deleted.
-AGENT_TTL = _float_env("AGENT_EVENTS_AGENT_TTL", 7 * 86400)
+# Subscriptions of agents that are gone for this long are deleted. As long as events are kept:
+# an agent stopped for a week and then resumed still has them (7 days dropped those).
+AGENT_TTL = _float_env("AGENT_EVENTS_AGENT_TTL", 30 * 86400)
 EVENT_TTL = _float_env("AGENT_EVENTS_EVENT_TTL", 30 * 86400)
 # After the first event shows up, a watch waits this long to batch a burst together.
 WATCH_SETTLE = _float_env("AGENT_EVENTS_WATCH_SETTLE", 1.5)

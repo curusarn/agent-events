@@ -406,19 +406,22 @@ class Daemon:
 
     def op_session_start(self, req):
         """A Claude Code session started in process `pid`: any other agent recorded with that
-        pid is a previous session of the same process (e.g. before /clear) and is no longer
-        running: it is retired, so its topics stop being polled (nobody will read its events).
-        Its subscriptions stay until it expires, and polling resumes if it is resumed."""
+        pid is a previous session of the same process (e.g. before /clear, or a resume into
+        another conversation) and is no longer running. It is the same agent continuing, so its
+        subscriptions (filters included; not push topics, each session has its own inbox) move
+        to the new session, and the old one is retired."""
         agent, pid = req.get("agent"), req.get("pid")
         if not agent or not pid:
-            return {"ok": True, "retired": []}
+            return {"ok": True, "retired": [], "moved": []}
         retired = [a["id"] for a in self.store.agents() if a["pid"] == pid and a["id"] != agent]
+        moved = []
         for a in retired:
+            moved += self.op_transfer({"from": a, "to": agent, "move": True})["topics"]
             self.store.x("UPDATE agents SET pid = NULL, last_seen = MIN(last_seen, ?), retired = ? WHERE id = ?",
                          (time.time() - config.AGENT_IDLE, time.time(), a))
         if self.store.subs(agent):
             self.store.touch_agent(agent, pid)
-        return {"ok": True, "retired": retired}
+        return {"ok": True, "retired": retired, "moved": moved}
 
     def op_log(self, req):
         agent = self._agent(req)

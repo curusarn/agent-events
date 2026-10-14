@@ -80,9 +80,9 @@ The first poll of anything is a silent baseline. After that, each poll is diffed
 snapshot. Everything subscribed is polled, also for agents that aren't running (e.g. stopped in
 Hyperfocus): their events wait for them, stamped with the source's own time (a comment's creation
 time, not when it was seen), and the `unread` op (`{"op": "unread", "agents"?, "exclude"?, "since"?, "events"?}`) tells
-an app which agents have something waiting. Only a retired session (one that a newer session of
-the same Claude process replaced, e.g. after /clear) isn't polled, until it is resumed. After 7
-days of inactivity an agent and its subscriptions are dropped.
+an app which agents have something waiting. When a newer session of the same Claude process
+replaces one (e.g. after /clear), the old session's subscriptions move to the new one: it is the
+same agent continuing. After 30 days of inactivity an agent and its subscriptions are dropped.
 
 Override poll intervals with `AGENT_EVENTS_POLL_GITHUB=30` and similar. Put these, or tokens
 (`LINEAR_API_KEY`, `SLACK_USER_TOKEN`), in `~/.agent-events/env`. The daemon re-reads that file
