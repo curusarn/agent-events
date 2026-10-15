@@ -47,6 +47,8 @@ FIELDS = [  # (snapshot key, label)
     ("state", "status"), ("assignee", "assignee"), ("priority", "priority"), ("project", "project"),
     ("cycle", "cycle"), ("estimate", "estimate"), ("due", "due date"), ("parent", "parent"), ("title", "title"),
 ]
+SELF_QA_HINT = ("Your issue reached Self QA: run the PM check now (linear skill: verify on production, "
+                "comment 🤖 PM:, move to PM review) if your task built it.")
 
 
 def api_key() -> str:
@@ -120,7 +122,8 @@ def diff(old: dict, new: dict, topic: str) -> EventList:
     ev = EventList(topic, new["url"])
     for key, label in FIELDS:
         if old.get(key) != new.get(key):
-            ev.add(key, f"{label}: {old.get(key) or 'none'} → {new.get(key) or 'none'}")
+            hint = SELF_QA_HINT if key == "state" and (new.get(key) or "").lower() == "self qa" else ""
+            ev.add(key, f"{label}: {old.get(key) or 'none'} → {new.get(key) or 'none'}", body=hint)
     added, removed = list_changes(old["labels"], new["labels"])
     for x in added:
         ev.add("labels", f"label added: {x}")

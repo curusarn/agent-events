@@ -204,6 +204,13 @@ class LinearDiffTests(unittest.TestCase):
             ("linear/T-1/cccccccc", "comment by Ann", False),
         ])
 
+    def test_self_qa_tells_the_agent_to_run_the_pm_check(self):
+        events = linear.diff(lin_snapshot(state="In Review"), lin_snapshot(state="Self QA"), "linear/T-1")
+        self.assertEqual([(e.summary, e.body) for e in events], [("status: In Review → Self QA", linear.SELF_QA_HINT)])
+        self.assertIn("PM check", linear.SELF_QA_HINT)
+        later = linear.diff(lin_snapshot(state="Self QA"), lin_snapshot(state="PM review"), "linear/T-1")
+        self.assertEqual(later[0].body, "")
+
     def test_resolve_thread(self):
         state = lin_snapshot(comments={"aaaaaaaa-1": lin_comment(), "bbbbbbbb-2": lin_comment(parent="aaaaaaaa-1")})
         src = linear.Linear()
