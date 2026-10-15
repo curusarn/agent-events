@@ -47,9 +47,9 @@ FIELDS = [  # (snapshot key, label)
     ("state", "status"), ("assignee", "assignee"), ("priority", "priority"), ("project", "project"),
     ("cycle", "cycle"), ("estimate", "estimate"), ("due", "due date"), ("parent", "parent"), ("title", "title"),
 ]
-SELF_QA_HINT = ("Your issue reached Self QA: run the PM check now if your task built it (linear skill: verify on "
-                "production, comment 🤖 PM:, then move it to PM review only if it needs Simon's product taste "
-                "check; a simple task goes to Done).")
+SELF_QA_HINT = ("Your issue reached Self QA: if your task built it, run the PM check now (linear skill: verify on "
+                "production, comment 🤖 PM:). Simple change: move it to PM review. Needs Simon's product taste: "
+                "leave it in Self QA and tell your parent.")
 
 
 def api_key() -> str:
