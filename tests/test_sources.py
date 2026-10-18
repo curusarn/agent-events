@@ -7,7 +7,7 @@ from unittest import mock
 
 from agent_events.sources import TopicError, parse
 from agent_events.sources.base import SourceError
-from agent_events.sources import github, linear, slack
+from agent_events.sources import docs, github, linear, slack
 
 
 class ParseTests(unittest.TestCase):
@@ -51,6 +51,17 @@ class ParseTests(unittest.TestCase):
             with self.assertRaises(TopicError, msg=bad) as cm:
                 parse(bad)
             self.assertIn("hf/agent/<id>", str(cm.exception))
+
+    def test_docs(self):
+        self.assertEqual(self.topic("docs/U-9225"), "docs/U-9225")
+        self.assertEqual(self.topic("docs/U-9225/docs-uptime-monitor"), "docs/U-9225/docs-uptime-monitor")
+        self.assertEqual(self.topic("docs/docs-maint~docs-fix~x-20260924T081318Z"), "docs/docs-maint~docs-fix~x-20260924T081318Z")
+        self.assertEqual(self.topic("https://betterstack.com/admin/articles/unpublished/docs-bot/x-1?tab=diff"),
+                         "docs/docs-bot~x-1")
+        self.assertEqual(self.topic("https://betterstack.com/admin/articles/unpublished/uptime%23123"), "docs/uptime#123")
+        self.assertRaises(TopicError, parse, "docs")
+        self.assertRaises(TopicError, parse, "docs/a/b/c")
+        self.assertRaises(TopicError, parse, "docs/a b")
 
     def test_unknown(self):
         self.assertRaises(TopicError, parse, "https://example.com/x")
@@ -222,6 +233,67 @@ class LinearDiffTests(unittest.TestCase):
         new = lin_snapshot(comments={"a": lin_comment(body="changed")})
         kinds = [e.kind for e in linear.diff(old, new, "linear/T-1")]
         self.assertEqual(kinds, ["comment_edited", "comment_deleted"])
+
+
+def docs_member(article, vid, published_at=None, by=None, app=None):
+    return {"article_canonical_id": article, "version_id": vid, "published": bool(published_at),
+            "published_at": published_at, "published_by": by and {"id": 1, "name": by}, "published_by_app": app}
+
+
+class DocsDiffTests(unittest.TestCase):
+    def snap(self, *members, ref="U-1"):
+        return docs.snapshot(ref, list(members))
+
+    def test_publish_of_a_whole_batch(self):
+        old = self.snap(docs_member("a", 1), docs_member("b/c", 2), docs_member("d", 3, "2026-10-01T10:00:00Z", "Ann"))
+        new = self.snap(docs_member("a", 1, "2026-10-18T16:54:51Z", "Simon Let"),
+                        docs_member("b/c", 2, "2026-10-18T16:54:52Z", "Simon Let"),
+                        docs_member("d", 3, "2026-10-01T10:00:00Z", "Ann"))
+        events = docs.diff(old, new)
+        got = [(e.topic, e.kind, e.summary, e.data.get("status")) for e in events]
+        self.assertEqual(got, [
+            ("docs/U-1/a", "published", "published: a (batch U-1) by Simon Let", "published"),
+            ("docs/U-1/b~c", "published", "published: b/c (batch U-1) by Simon Let", "published"),
+            ("docs/U-1", "batch", "batch U-1 published: 2 published, 0 discarded", "published"),
+        ])
+        self.assertEqual(events[0].data, {"article": "a", "version": 1, "batch": "U-1", "status": "published"})
+        self.assertEqual(events[0].actor, "Simon Let")
+        self.assertEqual(events[0].at, 1792342491.0)
+        self.assertEqual((events[0].body, events[2].body), ("", "published: a\npublished: b/c\n" + docs.DONE_HINT))
+        self.assertEqual(events[0].url, "https://betterstack.com/admin/articles/unpublished/U-1")
+        self.assertEqual(events[2].data["published"], ["a", "b/c"])
+        self.assertEqual(docs.diff(new, new), [])
+
+    def test_partial_publish_has_no_batch_event(self):
+        events = docs.diff(self.snap(docs_member("a", 1), docs_member("b", 2)),
+                           self.snap(docs_member("a", 1, "2026-10-18T16:54:51Z", app="docs-terminal"), docs_member("b", 2)))
+        self.assertEqual([(e.kind, e.summary) for e in events], [("published", "published: a (batch U-1) by docs-terminal")])
+
+    def test_discard_restage_and_stage(self):
+        old = self.snap(docs_member("a", 1), docs_member("b", 2))
+        new = self.snap(docs_member("b", 5), docs_member("c", 6))
+        got = [(e.topic, e.kind, e.data.get("version"), e.data.get("status")) for e in docs.diff(old, new)]
+        self.assertEqual(got, [
+            ("docs/U-1/a", "discarded", 1, "discarded"),
+            ("docs/U-1/b", "restaged", 5, "staged"),
+            ("docs/U-1/c", "staged", 6, "staged"),
+        ])
+
+    def test_discarded_batch(self):
+        events = docs.diff(self.snap(docs_member("a", 1), docs_member("b", 2, "2026-10-01T10:00:00Z", "Ann")),
+                           self.snap(docs_member("b", 2, "2026-10-01T10:00:00Z", "Ann")))
+        self.assertEqual([(e.kind, e.summary, e.body) for e in events], [
+            ("discarded", "discarded: a (batch U-1)", ""),
+            ("batch", "batch U-1 discarded: 0 published, 1 discarded", "discarded: a"),
+        ])
+
+    def test_resolve(self):
+        src = docs.Docs()
+        state = self.snap(docs_member("a/b", 1), ref="x/y")
+        self.assertEqual(src.resolve(["x~y", "a~b"], state), (["x~y", "a~b"], "a/b: staged"))
+        self.assertRaises(TopicError, src.resolve, ["x~y", "zz"], state)
+        self.assertRaises(TopicError, src.resolve, ["nope"], self.snap(ref="nope"))
+        self.assertEqual(src.poll_key(["x~y", "a~b"]), ["x~y"])
 
 
 class SlackThreadTests(unittest.TestCase):

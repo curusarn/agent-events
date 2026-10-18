@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .base import Event, PollResult, Source, SourceError, TopicError
+from .docs import Docs
 from .github import GitHub
 from .hf import HF
 from .linear import Linear
@@ -17,7 +18,7 @@ def register(source: Source) -> None:
         ALIASES[alias] = source.type
 
 
-for _s in (GitHub(), Linear(), HF(), Slack()):
+for _s in (GitHub(), Linear(), HF(), Slack(), Docs()):
     register(_s)
 
 

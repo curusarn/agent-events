@@ -74,6 +74,8 @@ under it.
 | `linear/<ISSUE>/<thread>` | (shares the ticket's poll) | comments in one thread; `<thread>` = first 8 hex chars of the top-level comment id, as in `#comment-xxxxxxxx` links |
 | `slack/<channel>/<thread-ts>` | 30s | replies, edits, deletions, reactions |
 | `slack/<channel>` | 30s | new messages, replies in recently active threads (published on the thread topic) |
+| `docs/<source_ref>` | 60s | a staged Better Stack docs batch: per article published (and by whom) / discarded / restaged / staged (published on `docs/<source_ref>/<canonical_id>`), plus one `batch` event when nothing in it is left unpublished; `/` in a ref or canonical_id is written `~` |
+| `docs/<source_ref>/<canonical_id>` | (shares the batch's poll) | one article's version in the batch |
 | `hf/agent/<id>`, `hf/thread/<id>` | push (not polled) | messages published by the Hyperfocus app (or `agent-events publish`); each carries its sender (`actor`) |
 
 The first poll of anything is a silent baseline. After that, each poll is diffed against the stored
@@ -87,13 +89,14 @@ same agent continuing. After 30 days of inactivity an agent and its subscription
 Override poll intervals with `AGENT_EVENTS_POLL_GITHUB=30` and similar. GitHub checks whose name matches
 `AGENT_EVENTS_IGNORE_CHECKS` (a regex, default `\(shadow\)`: shadow CI runs beside the real one; empty
 turns it off) give no events and are left out of the pass/fail counts and the overall CI result. Put these, or tokens
-(`LINEAR_API_KEY`, `SLACK_USER_TOKEN`), in `~/.agent-events/env`. The daemon re-reads that file
-when it changes. Instead of a token, `AGENT_EVENTS_LINEAR_OP_REF` and `AGENT_EVENTS_SLACK_OP_REF`
-there read it from 1Password (e.g. `op://<vault>/<item>/credential`); with neither, that source
-is off.
+(`LINEAR_API_KEY`, `SLACK_USER_TOKEN`, `DOCS_ADMIN_API_KEY`), in `~/.agent-events/env`. The daemon re-reads that file
+when it changes. Instead of a token, `AGENT_EVENTS_LINEAR_OP_REF`, `AGENT_EVENTS_SLACK_OP_REF` and
+`AGENT_EVENTS_DOCS_OP_REF` there read it from 1Password (e.g. `op://<vault>/<item>/credential`); with neither, that source
+is off. The docs source polls the docs admin API's `GET /batches/<source_ref>` (any key; `DOCS_ADMIN_API_URL`
+overrides `https://betterstack.com`).
 It reads through Hyperfocus's op broker (`~/.hyperfocus/bin/op`) when that is installed, so the
 app's 1Password access and memory cache serve it; `AGENT_EVENTS_OP` names another `op`. Nothing is
-read until a Linear or Slack topic is subscribed, and a failing `op read` is retried only every 10
+read until a topic needing it is subscribed, and a failing `op read` is retried only every 10
 minutes (`AGENT_EVENTS_SECRET_RETRY`), since it may ask for Touch ID each time.
 
 ## Delivery semantics
