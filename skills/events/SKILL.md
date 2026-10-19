@@ -35,7 +35,7 @@ URLs are accepted anywhere a topic is and converted for you (prefer passing the 
 
 | Topic | What you get |
 |---|---|
-| `github/<owner>/<repo>/<pr>` | Everything on the PR: comments, inline review comments, reviews, review requests, CI failures and final CI result, pushes/force-pushes, merge/close/reopen, draft/ready, conflicts, labels, assignees, title/description edits, threads resolved |
+| `github/<owner>/<repo>/<pr>` | Everything on the PR: comments (a comment posted through Linear's review UI says "via Linear": its author wrote it there, even when an agent shares the login), inline review comments, reviews, review requests, CI failures and final CI result, pushes/force-pushes, merge/close/reopen, draft/ready, conflicts, labels, assignees, title/description edits, threads resolved |
 | `linear/<ISSUE-ID>` | Everything on the ticket: status, assignee, priority, project, cycle, labels, estimate, due date, parent, title, description, all comments |
 | `linear/<ISSUE-ID>/<thread>` | Only one comment thread (`<thread>` = the 8 hex chars from a `#comment-xxxxxxxx` link; any comment in the thread works) |
 | `slack/<channel-id>/<thread-ts>` | One thread: replies, edits, deletions, reactions |

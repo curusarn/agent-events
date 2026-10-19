@@ -69,7 +69,7 @@ under it.
 
 | Topic | Poll | Events |
 |---|---|---|
-| `github/<owner>/<repo>/<pr>` | 60s | comments, review comments, reviews, review requests, failed checks + CI result, pushes / force-pushes, merged / closed / reopened, draft / ready, conflicts, labels, assignees, title / description, threads resolved |
+| `github/<owner>/<repo>/<pr>` | 60s | comments ("via Linear" when posted through Linear's review UI), review comments, reviews, review requests, failed checks + CI result, pushes / force-pushes, merged / closed / reopened, draft / ready, conflicts, labels, assignees, title / description, threads resolved |
 | `linear/<ISSUE>` | 60s | status, assignee, priority, project, cycle, labels, estimate, due, parent, title, description, comments (published on `linear/<ISSUE>/<thread>`) |
 | `linear/<ISSUE>/<thread>` | (shares the ticket's poll) | comments in one thread; `<thread>` = first 8 hex chars of the top-level comment id, as in `#comment-xxxxxxxx` links |
 | `slack/<channel>/<thread-ts>` | 30s | replies, edits, deletions, reactions |

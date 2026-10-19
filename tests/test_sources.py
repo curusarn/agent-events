@@ -183,6 +183,29 @@ class GitHubDiffTests(unittest.TestCase):
         edited["comments"]["C1"]["body"] = "rename it"
         self.assertEqual(self.kinds(new, edited), [("review_comment_edited", "review comment on a.py:3 edited by @bob")])
 
+    def test_comment_posted_through_linear(self):
+        def comment(body, db):
+            return {"kind": "comment", "author": "me", "body": body, "url": "u", "updated": "t", "db": db}
+
+        src = github.GitHub()
+        old = gh_snapshot(comments={"C0": comment("earlier", "100")})
+        new = gh_snapshot(comments={"C0": comment("earlier", "100"), "C1": comment("auto merge", "101"),
+                                    "C2": comment("🤖 done", "102")})
+        slugs = {"101": "linear-code\n", "102": "\n"}
+        run = mock.Mock(side_effect=lambda cmd, **kw: mock.Mock(returncode=0, stdout=slugs[cmd[2].rsplit("/", 1)[1]]))
+        with mock.patch.object(github, "graphql"), mock.patch.object(github, "snapshot", return_value=new), \
+                mock.patch("subprocess.run", run):
+            r = src.poll(["o", "r", "1"], old)
+        self.assertEqual([(e.summary, e.data.get("via"), e.data["mine"]) for e in r.events], [
+            ("comment by @me via Linear", "linear-code", False),  # the operator in Linear, not an agent
+            ("comment by @me", None, True),
+        ])
+        self.assertEqual(run.call_count, 2)  # only the new comments, not C0
+        edited = copy.deepcopy(r.state)
+        edited["comments"]["C1"]["body"] = "auto merge pls"
+        github.add_apps("o", "r", r.state, edited)  # "via" carried over, no second lookup
+        self.assertEqual(self.kinds(r.state, edited), [("comment_edited", "comment edited by @me via Linear")])
+
 
 def lin_snapshot(**over):
     s = {"viewer": "U1", "id": "x", "identifier": "T-1", "url": "https://linear.app/i/T-1", "title": "Task",

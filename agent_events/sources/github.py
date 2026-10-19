@@ -28,7 +28,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       reviewRequests(first: 20) {
         nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } ... on Bot { login } } }
       }
-      comments(last: 100) { nodes { id author { login } body url createdAt updatedAt } }
+      comments(last: 100) { nodes { id fullDatabaseId author { login } body url createdAt updatedAt } }
       reviews(last: 100) { nodes { id author { login } state body url submittedAt updatedAt } }
       reviewThreads(last: 100) {
         nodes {
@@ -85,6 +85,10 @@ def counted(snap: dict) -> tuple[dict, str | None]:
     if any(s in FAILED for s in states):
         return checks, rollup
     return checks, "SUCCESS" if all(s in PASSED for s in states) else "PENDING"
+# The GitHub App a PR comment was posted through (REST performed_via_github_app; GraphQL doesn't
+# have it), by slug. Agents share their operator's account, so "via Linear" tells a comment the
+# person wrote in Linear's review UI apart from one an agent posted with the same login.
+APP_NAMES = {"linear-code": "Linear"}
 URL_RE = re.compile(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/(\d+)", re.I)
 
 
@@ -107,6 +111,27 @@ def graphql(query: str, **variables) -> dict:
     return data["data"]
 
 
+def app_slug(owner: str, repo: str, comment_id: str) -> str:
+    """The slug of the GitHub App a PR (issue) comment was posted through, "" if none or unknown."""
+    cmd = [os.environ.get("AGENT_EVENTS_GH", "gh"), "api", f"repos/{owner}/{repo}/issues/comments/{comment_id}",
+           "--jq", ".performed_via_github_app.slug // \"\""]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def add_apps(owner: str, repo: str, old: dict, new: dict) -> None:
+    """Fill in "via" for the PR comments this poll reports (new or edited); keep it for the rest."""
+    for cid, c in new["comments"].items():
+        prev = old["comments"].get(cid)
+        if prev and "via" in prev:
+            c["via"] = prev["via"]
+        elif c["kind"] == "comment" and c.get("db") and (prev is None or prev["body"] != c["body"]):
+            c["via"] = app_slug(owner, repo, c["db"])
+
+
 def login(node: dict | None) -> str:
     return ((node or {}).get("author") or {}).get("login") or "ghost"
 
@@ -126,7 +151,8 @@ def snapshot(data: dict) -> dict:
     comments = {}
     for c in pr["comments"]["nodes"]:
         comments[c["id"]] = {"kind": "comment", "author": login(c), "body": c["body"],
-                             "url": c["url"], "updated": c["updatedAt"], "created": c["createdAt"]}
+                             "url": c["url"], "updated": c["updatedAt"], "created": c["createdAt"],
+                             "db": c.get("fullDatabaseId")}
     threads = {}
     for t in pr["reviewThreads"]["nodes"]:
         where = f"{t['path']}:{t['line']}" if t.get("line") else t["path"]
@@ -245,15 +271,19 @@ def diff(old: dict, new: dict, topic: str) -> EventList:
     for cid, c in new["comments"].items():
         where = f" on {c['where']}" if c.get("where") else ""
         what = "review comment" if c["kind"] == "review_comment" else "comment"
+        app = c.get("via") if c.get("via") != c["author"] else ""  # an app's own bot needs no "via"
+        # Posted through an app (Linear's review UI), so the person, not an agent on their login.
+        who = {**by(c["author"]), "via": app, "mine": False} if app else by(c["author"])
+        through = f" via {APP_NAMES.get(app, app)}" if app else ""
         prev = old["comments"].get(cid)
         if prev is None:
             if not fresh(c, old["comments"]):
                 continue
-            ev.add(c["kind"], f"{what}{where} by @{c['author']}", body=c["body"], url=c["url"], at=c.get("created"),
-                   **by(c["author"]))
+            ev.add(c["kind"], f"{what}{where} by @{c['author']}{through}", body=c["body"], url=c["url"],
+                   at=c.get("created"), **who)
         elif prev["body"] != c["body"]:
-            ev.add(c["kind"] + "_edited", f"{what}{where} edited by @{c['author']}",
-                   body=c["body"], url=c["url"], at=c.get("updated"), **by(c["author"]))
+            ev.add(c["kind"] + "_edited", f"{what}{where} edited by @{c['author']}{through}",
+                   body=c["body"], url=c["url"], at=c.get("updated"), **who)
     for rid, r in new["reviews"].items():
         prev = old["reviews"].get(rid)
         verdict = r["state"].lower().replace("_", " ")
@@ -309,6 +339,8 @@ class GitHub(Source):
             # GitHub computes mergeability lazily; keep the last known value so a
             # MERGEABLE → UNKNOWN → CONFLICTING sequence is still seen as a change.
             new["mergeable"] = state["mergeable"]
+        if state:
+            add_apps(owner, repo, state, new)
         events = diff(state, new, "/".join([self.type] + key)) if state else []
         return PollResult(new, events, describe(new))
 
