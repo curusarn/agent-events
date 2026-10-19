@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -379,6 +380,29 @@ class SecretTests(unittest.TestCase):
             with mock.patch.object(self.config, "SECRET_RETRY", 0):
                 self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None)
             self.assertEqual(run.call_count, 2)
+
+    def test_parallel_lookups_share_one_op_read(self):
+        import threading
+        started = threading.Event()
+
+        def slow_read(*args, **kwargs):  # an op read waiting for the operator's Approve
+            started.set()
+            time.sleep(0.2)
+            return mock.Mock(returncode=0, stdout="tok\n")
+
+        env = {"AGENT_EVENTS_X_OP_REF": "op://v/x/credential"}
+        got = []
+        with mock.patch.dict("os.environ", env), mock.patch("subprocess.run", side_effect=slow_read) as run:
+            threads = [threading.Thread(target=lambda: got.append(
+                self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None))) for _ in range(3)]
+            threads[0].start()
+            started.wait(1)
+            for t in threads[1:]:
+                t.start()
+            for t in threads:
+                t.join(2)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(got, ["tok"] * 3)
 
     def test_no_op_ref_means_no_op_read(self):
         with mock.patch("subprocess.run") as run:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -115,6 +116,9 @@ def daemon_env() -> dict[str, str]:
 _secret_failed: dict[str, float] = {}  # op ref -> when `op read` last failed
 # Don't retry a failing `op read` sooner than this: it may prompt (Touch ID) every time.
 SECRET_RETRY = _float_env("AGENT_EVENTS_SECRET_RETRY", 600)
+# One `op read` per ref at a time: polls of one source run in parallel, and each read can prompt.
+_secret_locks: dict[str, threading.Lock] = {}
+_secret_locks_guard = threading.Lock()
 
 
 def op_binary() -> str:
@@ -139,6 +143,13 @@ def secret(env_names: list[str], op_ref_env: str, default_op_ref: str | None) ->
     ref = os.environ.get(op_ref_env, default_op_ref)
     if not ref:
         return None
+    with _secret_locks_guard:
+        lock = _secret_locks.setdefault(ref, threading.Lock())
+    with lock:
+        return _read_secret(ref)
+
+
+def _read_secret(ref: str) -> str | None:
     if ref in _secret_cache:
         return _secret_cache[ref]
     if time.time() - _secret_failed.get(ref, 0) < SECRET_RETRY:
