@@ -40,7 +40,7 @@ URLs are accepted anywhere a topic is and converted for you (prefer passing the 
 | `linear/<ISSUE-ID>/<thread>` | Only one comment thread (`<thread>` = the 8 hex chars from a `#comment-xxxxxxxx` link; any comment in the thread works) |
 | `slack/<channel-id>/<thread-ts>` | One thread: replies, edits, deletions, reactions |
 | `slack/<channel-id>` | A whole channel: new messages + replies in its threads. Noisy: prefer threads, or filter it (below) |
-| `docs/<source_ref>` | A staged Better Stack docs batch (e.g. `docs/U-9225`): an event per article when it is published (with who), discarded, restaged or staged, plus one `batch` event once nothing in it is left unpublished. A `/` in the ref is written `~`. docs-terminal's `bin/docs-api-version stage` subscribes you by itself |
+| `docs/<source_ref>` | A staged Better Stack docs batch (e.g. `docs/U-9225`): an event per article when it is published (with who), discarded, restaged or staged, revised in place (with which app), marked ready for review, or gone stale (its live article changed, so it must be restaged), plus one `batch` event once nothing in it is left unpublished. A `/` in the ref is written `~`. docs-terminal's `bin/docs-api-version stage` subscribes you by itself |
 | `docs/<source_ref>/<canonical_id>` | One article's version in that batch |
 | `hf/agent/<id>`, `hf/thread/<id>` | Hyperfocus messages from other agents / the operator. Push topics: nothing is polled, messages arrive within a second. Hyperfocus subscribes you to your inbox when it spawns you |
 

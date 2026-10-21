@@ -74,7 +74,7 @@ under it.
 | `linear/<ISSUE>/<thread>` | (shares the ticket's poll) | comments in one thread; `<thread>` = first 8 hex chars of the top-level comment id, as in `#comment-xxxxxxxx` links |
 | `slack/<channel>/<thread-ts>` | 30s | replies, edits, deletions, reactions |
 | `slack/<channel>` | 30s | new messages, replies in recently active threads (published on the thread topic) |
-| `docs/<source_ref>` | 60s | a staged Better Stack docs batch: per article published (and by whom) / discarded / restaged / staged (published on `docs/<source_ref>/<canonical_id>`), plus one `batch` event when nothing in it is left unpublished; `/` in a ref or canonical_id is written `~` |
+| `docs/<source_ref>` | 60s | a staged Better Stack docs batch: per article published (and by whom) / discarded / restaged / staged / revised in place (and by which app) / promoted to ready for review / gone stale (published on `docs/<source_ref>/<canonical_id>`), plus one `batch` event when nothing in it is left unpublished; `/` in a ref or canonical_id is written `~` |
 | `docs/<source_ref>/<canonical_id>` | (shares the batch's poll) | one article's version in the batch |
 | `hf/agent/<id>`, `hf/thread/<id>` | push (not polled) | messages published by the Hyperfocus app (or `agent-events publish`); each carries its sender (`actor`) |
 

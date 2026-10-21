@@ -293,6 +293,37 @@ class DocsDiffTests(unittest.TestCase):
                            self.snap(docs_member("a", 1, "2026-10-18T16:54:51Z", app="docs-terminal"), docs_member("b", 2)))
         self.assertEqual([(e.kind, e.summary) for e in events], [("published", "published: a (batch U-1) by docs-terminal")])
 
+    def test_changes_to_a_staged_version(self):
+        def staged(digest, draft=False, stale=False, edited_by=None):
+            return [{"id": 1, "staged_digest": digest, "draft": draft, "stale": stale, "edited_by_app": edited_by,
+                     "source_app": "docs-terminal", "admin_url": "https://betterstack.com/admin/articles/a/versions/1/diff"}]
+
+        members = [docs_member("a", 1)]
+        old = docs.snapshot("U-1", members, staged("d1", draft=True))
+        new = docs.snapshot("U-1", members, staged("d2", draft=False, stale=True, edited_by="docs-bot"))
+        events = docs.diff(old, new)
+        self.assertEqual([(e.topic, e.kind, e.summary, e.data["status"]) for e in events], [
+            ("docs/U-1/a", "revised", "revised: a (batch U-1) by docs-bot", "staged"),
+            ("docs/U-1/a", "promoted", "ready for review: a (batch U-1)", "staged"),
+            ("docs/U-1/a", "stale", "stale: a (batch U-1): its live article changed since it was staged, so it "
+             "can't publish until it's restaged", "stale"),
+        ])
+        self.assertEqual((events[0].actor, events[0].url), ("docs-bot", "https://betterstack.com/admin/articles/a/versions/1/diff"))
+        self.assertEqual(docs.diff(new, new), [])
+        # A state from before staged details were polled: nothing to compare yet, no events.
+        self.assertEqual(docs.diff(docs.snapshot("U-1", members), new), [])
+
+    def test_poll_reads_staged_details_only_while_something_is_staged(self):
+        src = docs.Docs()
+        with mock.patch.object(docs, "fetch_batch", return_value=[docs_member("a", 1, "2026-10-18T16:54:51Z", "Ann")]), \
+                mock.patch.object(docs, "fetch_unpublished") as unpublished:
+            src.poll(["U-1"], None)
+        unpublished.assert_not_called()
+        with mock.patch.object(docs, "fetch_batch", return_value=[docs_member("a", 1)]), \
+                mock.patch.object(docs, "fetch_unpublished", return_value=[{"id": 1, "staged_digest": "d"}]):
+            r = src.poll(["U-1"], None)
+        self.assertEqual(r.state["members"]["1"]["digest"], "d")
+
     def test_discard_restage_and_stage(self):
         old = self.snap(docs_member("a", 1), docs_member("b", 2))
         new = self.snap(docs_member("b", 5), docs_member("c", 6))
