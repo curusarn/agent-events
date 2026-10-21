@@ -442,6 +442,27 @@ class CliTest(DaemonTest):
 
 
 class CliTests(CliTest):
+    def test_subscribe_ends_with_what_the_agent_watches(self):
+        self.install_hook_watch()
+        for t in ("a", "b"):
+            self.fake.things[t] = {"version": 0, "events": []}
+        self.run_cli("--agent", "ag", "subscribe", "fake/a")
+        code, out = self.run_cli("--agent", "ag", "subscribe", "fake/b")
+        self.assertEqual(code, 0)
+        self.assertIn("Now subscribed to 2 topics:\n  fake/a  thing a v0\n  fake/b  thing b v0\n", out)
+        self.assertTrue(out.rstrip().endswith("you don't need to run `agent-events watch`."), out)
+
+    def test_failed_subscribe_ends_loud_without_the_hook_hint(self):
+        self.install_hook_watch()
+        self.fake.things["a"] = {"version": 0, "events": []}
+        code, out = self.run_cli("--agent", "ag", "subscribe", "fake/a", "fake", "x-1")
+        self.assertEqual(code, 1)
+        self.assertIn("✗ fake: ", out)  # on stdout, in order, not lost on stderr
+        self.assertIn("(did you mean fake/x-1?)", out)
+        self.assertIn("Now subscribed to 1 topic:\n  fake/a", out)
+        self.assertEqual(out.rstrip().splitlines()[-1], "FAILED: 2 of 3 topics not subscribed (fake, x-1); see ✗ above")
+        self.assertNotIn("hook wakes you", out)
+
     def test_watch_command_prints_events_and_acks(self):
         self.fake.things["a"] = {"version": 0, "events": []}
         self.run_cli("--agent", "ag", "subscribe", "fake/a")

@@ -155,8 +155,8 @@ def format_events(events: list[dict], title: bool = True) -> str:
 # --- commands ----------------------------------------------------------------------------
 
 def cmd_subscribe(args):
-    failed = False
-    for topic in args.topics:
+    failed = []
+    for i, topic in enumerate(args.topics):
         try:
             flt = {"about": [t.strip() for a in (args.about or []) for t in a.split(",") if t.strip()],
                    "mine": bool(args.mine)}
@@ -164,8 +164,9 @@ def cmd_subscribe(args):
         except DaemonDown as e:
             sys.exit(f"agent-events: daemon unavailable: {e}")
         if not resp.get("ok"):
-            print(f"✗ {topic}: {resp.get('error')}", file=sys.stderr)
-            failed = True
+            # On stdout, in order with the rest: an agent reads the output top to bottom.
+            print(f"✗ {topic}: {resp.get('error')}" + did_you_mean(args.topics, i))
+            failed.append(topic)
             continue
         verb = "subscribed to" if resp["new"] else "already subscribed to"
         print(f"✓ {verb} {resp['topic']}")
@@ -173,11 +174,30 @@ def cmd_subscribe(args):
             if line:
                 print(f"    {line}")
     status = call(agent_req(args, "list"))
+    # What the agent is really watching now, whatever it asked for.
+    subs = status["subscriptions"]
+    print(f"\nNow subscribed to {len(subs)} topic{'s' if len(subs) != 1 else ''}:" if subs else "\nNow subscribed to nothing.")
+    for s in subs:
+        summary = _squash(re.sub(r"\s*https?://\S+", "", s.get("summary") or ""))
+        print(f"  {s['topic']}" + (f"  {summary[:90]}{'…' if len(summary) > 90 else ''}" if summary else ""))
+    if failed:
+        # Last, so it is what an agent skimming the output sees; no reassuring hint after it.
+        print(f"\nFAILED: {len(failed)} of {len(args.topics)} topic{'s' if len(args.topics) != 1 else ''} not "
+              f"subscribed ({', '.join(failed)}); see ✗ above")
+        return 1
     if hook_watch_installed():
         print("\nThe agent-events hook wakes you with new events; you don't need to run `agent-events watch`.")
     elif not status["watching"]:
         print("\nNo watch is running for this agent: start `agent-events watch` in the background.")
-    return 1 if failed else 0
+    return 0
+
+
+def did_you_mean(topics: list[str], i: int) -> str:
+    """'linear T-1' typed as two words: suggest the topic they make together."""
+    from .sources import SOURCES
+    if topics[i] in SOURCES and i + 1 < len(topics) and "/" not in topics[i + 1]:
+        return f" (did you mean {topics[i]}/{topics[i + 1]}?)"
+    return ""
 
 
 def cmd_unsubscribe(args):
