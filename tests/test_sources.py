@@ -8,7 +8,7 @@ from unittest import mock
 
 from agent_events.sources import TopicError, parse
 from agent_events.sources.base import SourceError
-from agent_events.sources import docs, github, linear, slack
+from agent_events.sources import agentmail, docs, github, linear, slack
 
 
 class ParseTests(unittest.TestCase):
@@ -52,6 +52,14 @@ class ParseTests(unittest.TestCase):
             with self.assertRaises(TopicError, msg=bad) as cm:
                 parse(bad)
             self.assertIn("hf/agent/<id>", str(cm.exception))
+
+    def test_agentmail(self):
+        self.assertEqual(self.topic("agentmail/Simon-Says+Push-Delays@AgentMail.to"),
+                         "agentmail/simon-says+push-delays@agentmail.to")
+        source, parts = parse("agentmail/simon-says+push-delays@agentmail.to")
+        self.assertEqual(source.poll_key(parts), ["simon-says@agentmail.to"])
+        for bad in ("agentmail", "agentmail/simon-says", "agentmail/a@b.to/x", "agentmail/a b@b.to"):
+            self.assertRaises(TopicError, parse, bad)
 
     def test_docs(self):
         self.assertEqual(self.topic("docs/U-9225"), "docs/U-9225")
@@ -264,6 +272,59 @@ def docs_member(article, vid, published_at=None, by=None, app=None):
             "published_at": published_at, "published_by": by and {"id": 1, "name": by}, "published_by_app": app}
 
 
+def mail(mid, to, at="2026-10-22T10:00:00.000Z", cc=None, labels=("received", "unread"), subject="Hi"):
+    m = {"message_id": mid, "thread_id": "t-" + mid, "timestamp": at, "from": "Ann <ann@example.com>",
+         "to": to, "subject": subject, "labels": list(labels), "preview": "line one\nline two"}
+    if cc is not None:
+        m["cc"] = cc
+    return m
+
+
+class AgentMailDiffTests(unittest.TestCase):
+    INBOX = "simon-says@agentmail.to"
+
+    def snap(self, *messages):  # newest first, as the API lists them
+        return agentmail.snapshot(self.INBOX, list(messages))
+
+    def test_each_address_is_its_own_topic(self):
+        old = self.snap(mail("<1>", ["simon-says+x@agentmail.to"], "2026-10-22T09:00:00.000Z"))
+        new = self.snap(
+            mail("<4>", ["Bob <bob@example.com>"], labels=("sent",)),  # sent elsewhere: no event
+            mail("<3>", ["simon-says@agentmail.to"], cc=["Simon <Simon-Says+X@agentmail.to>"]),
+            mail("<2>", ["simon-says+push-delays@agentmail.to"], labels=("sent", "received")),
+            *old_messages(old))
+        events = agentmail.diff(old, new)
+        got = [(e.topic, e.summary) for e in events]
+        self.assertEqual(got, [
+            ("agentmail/simon-says+push-delays@agentmail.to",
+             "mail to simon-says+push-delays@agentmail.to from Ann <ann@example.com>: Hi"),
+            ("agentmail/simon-says@agentmail.to", "mail to simon-says@agentmail.to from Ann <ann@example.com>: Hi"),
+            ("agentmail/simon-says+x@agentmail.to", "mail to simon-says+x@agentmail.to from Ann <ann@example.com>: Hi"),
+        ])
+        e = events[0]
+        self.assertEqual((e.kind, e.actor, e.body, e.dedupe), ("mail", "Ann <ann@example.com>", "line one\nline two", "mail:<2>"))
+        self.assertEqual(e.data, {"address": "simon-says+push-delays@agentmail.to", "message_id": "<2>",
+                                  "thread_id": "t-<2>", "subject": "Hi", "from": "Ann <ann@example.com>"})
+        self.assertEqual(e.at, 1792663200.0)
+        self.assertEqual(agentmail.diff(new, new), [])
+
+    def test_older_message_moving_into_the_page_is_not_new(self):
+        old = self.snap(mail("<3>", [self.INBOX], "2026-10-22T10:00:00.000Z"),
+                        mail("<2>", [self.INBOX], "2026-10-22T09:00:00.000Z"))
+        new = self.snap(mail("<3>", [self.INBOX], "2026-10-22T10:00:00.000Z"),
+                        mail("<1>", [self.INBOX], "2026-10-22T08:00:00.000Z"))
+        self.assertEqual(agentmail.diff(old, new), [])
+
+    def test_other_inboxes_addresses_are_ignored(self):
+        old = self.snap()
+        new = self.snap(mail("<1>", ["greg.gorski@agentmail.to", "simon-says+a@agentmail.to"]))
+        self.assertEqual([e.topic for e in agentmail.diff(old, new)], ["agentmail/simon-says+a@agentmail.to"])
+
+
+def old_messages(snap):
+    return [mail(m["id"], m["to"], m["at"]) for m in snap["messages"]]
+
+
 class DocsDiffTests(unittest.TestCase):
     def snap(self, *members, ref="U-1"):
         return docs.snapshot(ref, list(members))
@@ -471,6 +532,7 @@ class CredentialDefaultsTest(unittest.TestCase):
         from agent_events.sources import linear, slack
         self.assertIsNone(linear.DEFAULT_OP_REF)
         self.assertIsNone(slack.DEFAULT_OP_REF)
+        self.assertIsNone(agentmail.DEFAULT_OP_REF)
 
     def test_op_binary_prefers_the_hyperfocus_broker(self):
         import tempfile

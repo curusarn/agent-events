@@ -76,6 +76,7 @@ under it.
 | `slack/<channel>` | 30s | new messages, replies in recently active threads (published on the thread topic) |
 | `docs/<source_ref>` | 60s | a staged Better Stack docs batch: per article published (and by whom) / discarded / restaged / staged / revised in place (and by which app) / promoted to ready for review / gone stale (published on `docs/<source_ref>/<canonical_id>`), plus one `batch` event when nothing in it is left unpublished; `/` in a ref or canonical_id is written `~` |
 | `docs/<source_ref>/<canonical_id>` | (shares the batch's poll) | one article's version in the batch |
+| `agentmail/<address>` | 60s | new mail to one AgentMail address, plus-alias included (`name+alias@agentmail.to`): one `mail` event per received message with the address in To or Cc (sender, subject, time, message id, thread id, a short preview). Matched exactly: each alias is its own topic, and the base address gets only mail sent to it. Every address of one inbox shares its poll |
 | `hf/agent/<id>`, `hf/thread/<id>` | push (not polled) | messages published by the Hyperfocus app (or `agent-events publish`); each carries its sender (`actor`) |
 
 The first poll of anything is a silent baseline. After that, each poll is diffed against the stored
@@ -89,11 +90,12 @@ same agent continuing. After 30 days of inactivity an agent and its subscription
 Override poll intervals with `AGENT_EVENTS_POLL_GITHUB=30` and similar. GitHub checks whose name matches
 `AGENT_EVENTS_IGNORE_CHECKS` (a regex, default `\(shadow\)`: shadow CI runs beside the real one; empty
 turns it off) give no events and are left out of the pass/fail counts and the overall CI result. Put these, or tokens
-(`LINEAR_API_KEY`, `SLACK_USER_TOKEN`, `DOCS_ADMIN_API_KEY`), in `~/.agent-events/env`. The daemon re-reads that file
-when it changes. Instead of a token, `AGENT_EVENTS_LINEAR_OP_REF`, `AGENT_EVENTS_SLACK_OP_REF` and
-`AGENT_EVENTS_DOCS_OP_REF` there read it from 1Password (e.g. `op://<vault>/<item>/credential`); with neither, that source
+(`LINEAR_API_KEY`, `SLACK_USER_TOKEN`, `DOCS_ADMIN_API_KEY`, `AGENTMAIL_API_KEY`), in `~/.agent-events/env`. The daemon re-reads that file
+when it changes. Instead of a token, `AGENT_EVENTS_LINEAR_OP_REF`, `AGENT_EVENTS_SLACK_OP_REF`,
+`AGENT_EVENTS_DOCS_OP_REF` and `AGENT_EVENTS_AGENTMAIL_OP_REF` there read it from 1Password (e.g. `op://<vault>/<item>/credential`); with neither, that source
 is off. The docs source polls the docs admin API's `GET /batches/<source_ref>` (any key; `DOCS_ADMIN_API_URL`
-overrides `https://betterstack.com`).
+overrides `https://betterstack.com`). The agentmail source polls `GET /inboxes/<inbox>/messages` of
+`https://api.agentmail.to/v0` (`AGENTMAIL_API_URL` overrides it), the newest 50 per poll.
 It reads through Hyperfocus's op broker (`~/.hyperfocus/bin/op`) when that is installed, so the
 app's 1Password access and memory cache serve it; `AGENT_EVENTS_OP` names another `op`. Nothing is
 read until a topic needing it is subscribed, and a failing `op read` is retried only every 10

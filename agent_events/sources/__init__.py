@@ -1,6 +1,7 @@
 """Registry of event types. Adding a type = add a Source subclass and list it here."""
 from __future__ import annotations
 
+from .agentmail import AgentMail
 from .base import Event, PollResult, Source, SourceError, TopicError
 from .docs import Docs
 from .github import GitHub
@@ -18,7 +19,7 @@ def register(source: Source) -> None:
         ALIASES[alias] = source.type
 
 
-for _s in (GitHub(), Linear(), HF(), Slack(), Docs()):
+for _s in (GitHub(), Linear(), HF(), Slack(), Docs(), AgentMail()):
     register(_s)
 
 
