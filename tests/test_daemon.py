@@ -45,6 +45,15 @@ class SubscriptionTests(DaemonTest):
         self.assertEqual(sorted(r["removed"]), ["fake/a", "fake/a/thread"])
         self.assertEqual(self.req(op="list", agent="ag")["subscriptions"], [])
 
+    def test_refresh_polls_only_the_topics_asked(self):
+        for t in ("a", "b"):
+            self.fake.things[t] = {"version": 0, "events": []}
+            self.req(op="subscribe", agent="ag", topic=f"fake/{t}")
+        self.assertEqual(self.req(op="refresh", topics=["fake/b", "nope/x"])["keys"], ["fake/b"])
+        self.assertEqual(self.daemon.store.target("fake/b")["next_poll"], 0)
+        self.assertGreater(self.daemon.store.target("fake/a")["next_poll"], 0)
+        self.assertEqual(self.req(op="refresh", agent="ag")["keys"], ["fake/a", "fake/b"])
+
     def test_subscribe_failure_leaves_nothing_behind(self):
         r = self.req(op="subscribe", agent="ag", topic="fake/missing")
         self.assertFalse(r["ok"])
@@ -241,6 +250,7 @@ class PushTests(DaemonTest):
         self.assertIsNone(self.daemon.store.target("hf/agent/abc123"))
         self.assertNotIn("hf/agent/abc123", self.daemon.active_keys())
         self.assertEqual(self.req(op="refresh", agent="ag")["keys"], [])
+        self.assertEqual(self.req(op="refresh", topics=["hf/agent/abc123"])["keys"], [])
         subs = self.req(op="list", agent="ag")["subscriptions"]
         self.assertEqual([(s["topic"], s["push"]) for s in subs], [("hf/agent/abc123", True)])
         self.assertFalse(self.req(op="subscribe", agent="ag", topic="hf/agent/abc123")["new"])

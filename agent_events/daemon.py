@@ -432,11 +432,15 @@ class Daemon:
         return {"ok": True, "events": self._annotate(self.store.recent(agent, int(req.get("limit") or 20), topic))}
 
     def op_refresh(self, req):
-        agent = self._agent(req)
+        """Poll an agent's topics right now, or only `topics` (any already polled: Hyperfocus asks
+        for a PR the moment it is marked ready, so its tab doesn't show the draft it just left)."""
+        topics = req.get("topics")
+        if topics is None:
+            topics = [s["topic"] for s in self.store.subs(self._agent(req))]
         keys = set()
-        for s in self.store.subs(agent):
+        for t in topics:
             try:
-                source, parts = parse(s["topic"])
+                source, parts = parse(t)
             except TopicError:
                 continue
             if not source.push:
