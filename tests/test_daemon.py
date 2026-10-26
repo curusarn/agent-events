@@ -795,6 +795,19 @@ class FilterTests(DaemonTest):
                               Event("fake/chan/222", "message", "reply in another thread", dedupe="msg:223")], time.time())
         self.assertEqual(self.pending(), ["QA: #6306 deployed", "reply: crash on login"])
 
+    def test_a_post_behind_a_page_of_noise_still_wakes(self):
+        """An FYI at the front holds the cursor; a post that wakes, more than a page of a busy
+        channel's unwanted messages later, is still handed over."""
+        from agent_events.sources.base import Event
+        self.sub(about=["U-9626"])
+        self.req(op="subscribe", agent="ag", topic="hf/agent/ag")
+        self.req(op="publish", topic="hf/agent/ag", summary="fyi", quiet=True)
+        self.daemon.store._insert_events([Event("fake/chan", "message", f"noise {i}", dedupe=f"msg:{i}")
+                                          for i in range(250)], time.time())
+        self.req(op="publish", topic="hf/agent/ag", summary="a post")
+        self.assertEqual([e["summary"] for e in self.daemon.store.pending("ag")], ["fyi", "a post"])
+        self.assertEqual(self.req(op="take", agent="ag", wake_only=True)["events"][-1]["summary"], "a post")
+
     def test_subscribing_again_without_a_filter_delivers_everything(self):
         self.sub(about=["x-term"])
         self.req(op="subscribe", agent="ag", topic="fake/chan")

@@ -259,27 +259,36 @@ class Store:
     # --- delivery -------------------------------------------------------------------
 
     def pending(self, agent: str, limit: int = 100) -> list[dict]:
-        rows = self.q(
-            f"SELECT e.* FROM events e WHERE e.id > (SELECT cursor FROM agents WHERE id = :a) AND EXISTS ("
-            f"SELECT 1 FROM subscriptions s WHERE s.agent_id = :a AND e.id > s.since AND {MATCH}) "
-            f"ORDER BY e.id LIMIT :n", {"a": agent, "n": limit})
+        def page(after: int | None) -> list:
+            return self.q(
+                f"SELECT e.* FROM events e WHERE e.id > COALESCE(:after, (SELECT cursor FROM agents WHERE id = :a)) "
+                f"AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.agent_id = :a AND e.id > s.since AND {MATCH}) "
+                f"ORDER BY e.id LIMIT :n", {"a": agent, "after": after, "n": limit})
+        rows = page(None)
         subs = self.subs(agent)
         if not any(s["filter"] for s in subs):
             return [event_dict(r) for r in rows]
         # Filtered subscriptions: only what the agent asked for. Events nobody here wants
         # before the first wanted one are skipped for good (the cursor moves past them), so
-        # a busy channel never piles up behind the filter.
+        # a busy channel never piles up behind the filter. Read on past a page of noise: an
+        # FYI left at the front holds the cursor, and a post that wakes can sit behind
+        # hundreds of a busy channel's unwanted messages (u9626-weekly-report missed its
+        # parent's posts for a day behind #support, 2026-10-25).
         mine = mine_terms([s["topic"] for s in subs])
         out, skip = [], None
-        for r in rows:
-            e = event_dict(r)
-            if self._wanted(e, r["id"], subs, mine):
-                out.append(e)
-            elif not out:
-                skip = r["id"]
+        while rows:
+            for r in rows:
+                e = event_dict(r)
+                if self._wanted(e, r["id"], subs, mine):
+                    out.append(e)
+                elif not out:
+                    skip = r["id"]
+            if len(out) >= limit or len(rows) < limit:
+                break
+            rows = page(rows[-1]["id"])
         if skip is not None and not self.readonly:
             self.ack(agent, skip)
-        return out
+        return out[:limit]
 
     def _wanted(self, e: dict, event_id: int, subs: list, mine: list[str]) -> bool:
         for s in subs:
