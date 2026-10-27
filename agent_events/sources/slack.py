@@ -146,7 +146,8 @@ def poll_thread(channel: str, thread: str, state: dict | None) -> PollResult:
     for m in msgs:
         snap[m["ts"]] = {
             "user": m.get("user"), "hash": short_hash(m.get("text")), "edited": (m.get("edited") or {}).get("ts"),
-            "reactions": {r["name"]: r.get("count", 0) for r in m.get("reactions") or []},
+            # Who reacted, per emoji: Slack lists the users with each reaction.
+            "reactions": {r["name"]: sorted(r.get("users") or []) for r in m.get("reactions") or []},
         }
     root = msgs[0]
     new = {"msgs": snap, "root_text": first_line(render(root.get("text")))}
@@ -169,13 +170,28 @@ def poll_thread(channel: str, thread: str, state: dict | None) -> PollResult:
         if prev["hash"] != cur["hash"]:
             ev.add("message_edited", f"message by {who} edited", body=render(m.get("text")), url=url, actor=who,
                    at=cur.get("edited"), **mine)
-        for name, count in cur["reactions"].items():
-            if count > prev["reactions"].get(name, 0):
-                ev.add("reaction", f":{name}: added to message by {who}", body=first_line(render(m.get("text"))),
-                       url=url)
-        for name in prev["reactions"]:
-            if name not in cur["reactions"]:
-                ev.add("reaction", f":{name}: removed from message by {who}", url=url)
+        for name, users in cur["reactions"].items():
+            before = prev["reactions"].get(name, [])
+            if isinstance(before, int):  # a snapshot from before reactors were kept: counts only
+                if len(users) > before:
+                    ev.add("reaction", f"someone added :{name}: to {who}'s message",
+                           body=first_line(render(m.get("text"))), url=url)
+                continue
+            added = [u for u in users if u not in before]
+            if added:
+                by = ", ".join(user_name(u) for u in added)
+                ev.add("reaction", f"{by} added :{name}: to {who}'s message", body=first_line(render(m.get("text"))),
+                       url=url, actor=by)
+        for name, before in prev["reactions"].items():
+            users = cur["reactions"].get(name, [])
+            if isinstance(before, int):
+                if not users:
+                    ev.add("reaction", f":{name}: removed from {who}'s message", url=url)
+                continue
+            removed = [u for u in before if u not in users]
+            if removed:
+                by = ", ".join(user_name(u) for u in removed)
+                ev.add("reaction", f"{by} removed :{name}: from {who}'s message", url=url, actor=by)
     for ts in old:
         if ts not in snap:
             ev.add("message_deleted", "a message in the thread was deleted")

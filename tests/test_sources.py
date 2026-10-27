@@ -428,11 +428,13 @@ class SlackThreadTests(unittest.TestCase):
         self.assertEqual(base.events, [])
         self.assertIn("question", base.summary)
         reply = {"ts": "101.000001", "user": "UME", "text": "answer", "thread_ts": "100.000001"}
-        root2 = dict(root, reactions=[{"name": "eyes", "count": 1}])
+        # Simon reacts to ann's message: the event names the reactor, not the author.
+        root2 = dict(root, reactions=[{"name": "eyes", "count": 1, "users": ["UME"]}])
         r = self.poll([root2, reply], base.state)
         got = [(e.kind, e.summary, e.data.get("mine")) for e in r.events]
-        self.assertEqual(got, [("reaction", ":eyes: added to message by ann", None),
+        self.assertEqual(got, [("reaction", "simon added :eyes: to ann's message", None),
                                ("message", "reply by simon", True)])
+        self.assertEqual(r.events[0].actor, "simon")
         self.assertEqual(r.events[1].dedupe, "msg:101.000001")
         self.assertEqual(r.events[1].at, 101.000001)  # stamped with the message's own time
         self.assertIn("thread_ts=100.000001", r.events[1].url)
@@ -440,6 +442,22 @@ class SlackThreadTests(unittest.TestCase):
         self.assertEqual([e.kind for e in edited.events], ["message_edited"])
         deleted = self.poll([root2], edited.state)
         self.assertEqual([e.kind for e in deleted.events], ["message_deleted"])
+
+    def test_reaction_reactors(self):
+        root = {"ts": "100.000001", "user": "UA", "text": "done?"}
+        both = dict(root, reactions=[{"name": "white_check_mark", "count": 2, "users": ["UA", "UME"]}])
+        base = self.poll([dict(root, reactions=[{"name": "white_check_mark", "count": 1, "users": ["UA"]}])], None)
+        r = self.poll([both], base.state)
+        self.assertEqual([e.summary for e in r.events], ["simon added :white_check_mark: to ann's message"])
+        r = self.poll([root], r.state)
+        self.assertEqual([e.summary for e in r.events], ["ann, simon removed :white_check_mark: from ann's message"])
+        # A snapshot stored before reactors were kept holds counts: say only what's known.
+        old = {"msgs": {"100.000001": {"user": "UA", "hash": slack.short_hash("done?"), "edited": None,
+                                       "reactions": {"eyes": 1}}}, "root_text": "done?"}
+        r = self.poll([dict(root, reactions=[{"name": "eyes", "count": 2, "users": ["UA", "UME"]},
+                                             {"name": "tada", "count": 1, "users": ["UME"]}])], old)
+        self.assertEqual([e.summary for e in r.events],
+                         ["someone added :eyes: to ann's message", "simon added :tada: to ann's message"])
 
     def test_channel_new_message_with_quick_reply(self):
         state = {"latest": "100.000001", "threads": {}}
