@@ -116,6 +116,12 @@ def daemon_env() -> dict[str, str]:
 _secret_failed: dict[str, float] = {}  # op ref -> when `op read` last failed
 # Don't retry a failing `op read` sooner than this: it may prompt (Touch ID) every time.
 SECRET_RETRY = _float_env("AGENT_EVENTS_SECRET_RETRY", 600)
+# A host's read refused because the Mac is asleep or offline showed no prompt: try again soon, so
+# polls come back within seconds of the Mac waking rather than up to SECRET_RETRY later (hyperfocus-1
+# after its restart while the Mac slept, 2026-10-30).
+UNREACHABLE_RETRY = _float_env("AGENT_EVENTS_UNREACHABLE_RETRY", 30)
+UNREACHABLE = "Hyperfocus on the Mac is not reachable"
+_secret_unreachable: set[str] = set()  # op refs whose last read failed only for that
 # One `op read` per ref at a time: polls of one source run in parallel, and each read can prompt.
 _secret_locks: dict[str, threading.Lock] = {}
 _secret_locks_guard = threading.Lock()
@@ -152,17 +158,23 @@ def secret(env_names: list[str], op_ref_env: str, default_op_ref: str | None) ->
 def _read_secret(ref: str) -> str | None:
     if ref in _secret_cache:
         return _secret_cache[ref]
-    if time.time() - _secret_failed.get(ref, 0) < SECRET_RETRY:
+    wait = UNREACHABLE_RETRY if ref in _secret_unreachable else SECRET_RETRY
+    if time.time() - _secret_failed.get(ref, 0) < wait:
         return None
     try:
         # Hyperfocus's op waits up to 330 s for the operator's Approve: wait it out, or a
         # first read Approved after 2 minutes still counts as failed for SECRET_RETRY.
         out = subprocess.run([op_binary(), "read", ref], capture_output=True, text=True, timeout=340)
         value = out.stdout.strip() if out.returncode == 0 else ""
+        unreachable = not value and UNREACHABLE in (out.stderr or "")
     except (OSError, subprocess.TimeoutExpired):
-        value = ""
+        value, unreachable = "", False
     if not value:
         _secret_failed[ref] = time.time()
+        if unreachable:
+            _secret_unreachable.add(ref)
+        else:
+            _secret_unreachable.discard(ref)
         return None
     _secret_cache[ref] = value
     return value

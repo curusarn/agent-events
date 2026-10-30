@@ -502,9 +502,10 @@ class SecretTests(unittest.TestCase):
         self.config = config
         config._secret_cache.clear()
         config._secret_failed.clear()
+        config._secret_unreachable.clear()
 
     def test_failed_op_read_is_not_retried_soon(self):
-        failed = mock.Mock(returncode=1, stdout="")
+        failed = mock.Mock(returncode=1, stdout="", stderr="")
         env = {"AGENT_EVENTS_X_OP_REF": "op://v/x/credential"}
         with mock.patch.dict("os.environ", env), mock.patch("subprocess.run", return_value=failed) as run:
             self.assertIsNone(self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None))
@@ -513,6 +514,36 @@ class SecretTests(unittest.TestCase):
             with mock.patch.object(self.config, "SECRET_RETRY", 0):
                 self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None)
             self.assertEqual(run.call_count, 2)
+
+    def test_mac_unreachable_is_retried_after_30_s_and_nothing_else_is(self):
+        away = mock.Mock(returncode=1, stdout="", stderr='[ERROR] Hyperfocus on the Mac is not reachable from host '
+                         '"hyperfocus-1" (asleep or offline): cannot connect to 100.65.214.33:7824.')
+        declined = mock.Mock(returncode=1, stdout="", stderr="[ERROR] Simon declined")
+        ok = mock.Mock(returncode=0, stdout="tok\n", stderr="")
+        env = {"AGENT_EVENTS_X_OP_REF": "op://v/x/credential"}
+        now = time.time()
+
+        def at(seconds):
+            return mock.patch.object(self.config.time, "time", return_value=now + seconds)
+
+        def lookup():
+            return self.config.secret(["X_TOKEN_UNSET"], "AGENT_EVENTS_X_OP_REF", None)
+
+        with mock.patch.dict("os.environ", env), mock.patch("subprocess.run", side_effect=[away, declined, ok]) as run:
+            with at(0):
+                self.assertIsNone(lookup())       # the Mac is asleep
+            with at(20):
+                self.assertIsNone(lookup())       # within 30 s: no read
+            self.assertEqual(run.call_count, 1)
+            with at(31):
+                self.assertIsNone(lookup())       # read again; this time Simon declines
+            self.assertEqual(run.call_count, 2)
+            with at(31 + 300):
+                self.assertIsNone(lookup())       # a declined read waits the full SECRET_RETRY
+            self.assertEqual(run.call_count, 2)
+            with at(31 + self.config.SECRET_RETRY + 1):
+                self.assertEqual(lookup(), "tok")
+            self.assertEqual(run.call_count, 3)
 
     def test_parallel_lookups_share_one_op_read(self):
         import threading
