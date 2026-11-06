@@ -216,6 +216,17 @@ class WatchTests(DaemonTest):
         self.assertEqual(self.req(op="unread", since=time.time() - 60)["agents"]["ag"]["count"], 2)
         self.assertEqual(self.req(op="unread", agents=["other"])["agents"], {})
 
+    def test_unread_counts_comments_that_wake_a_stopped_agent_by_when_they_were_seen(self):
+        from agent_events.sources import Event
+        self.fake.things["a"] = {"version": 0, "events": []}
+        self.req(op="subscribe", agent="ag", topic="fake/a")
+        old = time.time() - 3 * 86400  # written days ago, as after days offline
+        self.daemon.store.save_poll("fake/b", {"v": 1}, "b", time.time() + 60, [
+            Event("fake/a", "comment", "seen now", at=old, dedupe="now", data={"wakes_stopped_at": time.time()}),
+            Event("fake/a", "comment", "seen days ago", at=old, dedupe="then", data={"wakes_stopped_at": old}),
+            Event("fake/a", "comment", "a 🤖 comment", at=old, dedupe="robot")])
+        self.assertEqual(self.req(op="unread")["agents"]["ag"]["wakes"], 1)
+
     def test_unread_skips_news_older_than_what_the_agent_already_got(self):
         from agent_events.sources import Event
         self.req(op="subscribe", agent="ag", topic="fake/a")

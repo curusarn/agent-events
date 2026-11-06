@@ -121,11 +121,11 @@ is watching wait for the next delivery.
 
 Subscriptions outlive your memory of them — that's the point — so prune them:
 
-- When you're done with something (PR merged/closed and no follow-ups, ticket finished, thread
-  resolved), `agent-events unsubscribe <topic>`.
+- When you're done with something (PR merged/closed and no follow-ups, thread resolved),
+  `agent-events unsubscribe <topic>`. A Linear issue your task builds stays until it's Done or cancelled.
 - If events feel noisy, run `agent-events list`, drop what no longer matters, or narrow a ticket
   subscription to the specific comment thread (`linear/T-123/<thread>`) or a channel to a thread.
-- `agent-events unsubscribe --all` when your whole task is complete.
+- When your whole task is complete, unsubscribe from everything but those issues and your `hf/` inbox.
 
 ## Troubleshooting
 

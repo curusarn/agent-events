@@ -215,6 +215,16 @@ class GitHubDiffTests(unittest.TestCase):
         self.assertEqual(self.kinds(r.state, edited), [("comment_edited", "comment edited by @me via Linear")])
 
 
+JULIE_REVIEW = ("🤖 **Julie auto-review** · T-22450 is in PM review and its last pull request, [logtail#19159](u), merged 3 days ago.\n\n"
+                "**⚠️ Works, with findings**: a replay invents an incident.\n\n**Findings**\n- [ ] ⚠️ A replay reads 0.\n\n"
+                "**Suggested new issues**\n- `Bug: [AI SRE] A replay`\n\n+++ Details for AI\nbody\n+++")
+
+
+def wake_comment(author, body, author_id="U2"):
+    return {"author": author, "author_id": author_id, "body": body, "url": "u", "created": "2026-11-06T02:40:47Z",
+            "updated": "2026-11-06T02:40:47Z", "parent": None, "hash": "h"}
+
+
 def lin_snapshot(**over):
     s = {"viewer": "U1", "id": "x", "identifier": "T-1", "url": "https://linear.app/i/T-1", "title": "Task",
          "description": "d", "state": "Todo", "assignee": None, "priority": "Low", "project": None, "cycle": None,
@@ -599,3 +609,36 @@ class CredentialDefaultsTest(unittest.TestCase):
                 self.assertEqual(config.op_binary(), broker)
                 with mock.patch.dict(os.environ, {"AGENT_EVENTS_OP": "/x/op"}):
                     self.assertEqual(config.op_binary(), "/x/op")
+
+
+class LinearWakesStoppedTest(unittest.TestCase):
+    def wakes(self, comment, state_type="started"):
+        new = lin_snapshot(state_type=state_type, comments={"C1": comment})
+        return [bool(e.data.get("wakes_stopped_at")) for e in linear.diff(lin_snapshot(), new, "linear/T-1") if e.kind == "comment"][0]
+
+    def test_julie_review_with_a_warning_wakes(self):
+        self.assertTrue(self.wakes(wake_comment("Julie Blanchard", JULIE_REVIEW)))
+
+    def test_julie_review_with_a_broken_verdict_wakes(self):
+        self.assertTrue(self.wakes(wake_comment("Julie Blanchard", "🤖 **Julie auto-review** · x\n\n**🚨 Does not work as promised**: y")))
+
+    def test_julie_review_that_raised_nothing_or_nitpicks_does_not(self):
+        review = "🤖 **Julie auto-review** · x\n\n**✅ Works as promised**: y\n\n**Findings**\n- [ ] Nitpick: z\n\n"
+        self.assertFalse(self.wakes(wake_comment("Julie Blanchard", review + "+++ Details for AI\n**⚠️ old**\n+++")))
+
+    def test_julie_reply_does_not(self):
+        self.assertFalse(self.wakes(wake_comment("Julie Blanchard", "Filed it")))
+
+    def test_colleague_wakes_but_not_on_a_closed_issue(self):
+        self.assertTrue(self.wakes(wake_comment("Mirko Akov", "This breaks on Safari")))
+        self.assertFalse(self.wakes(wake_comment("Mirko Akov", "This breaks on Safari"), "completed"))
+        self.assertFalse(self.wakes(wake_comment("Mirko Akov", "This breaks on Safari"), "canceled"))
+
+    def test_agents_and_bots_do_not(self):
+        self.assertFalse(self.wakes(wake_comment("Šimon Let", "🤖: Draft fix in logtail#1", "U1")))
+        self.assertFalse(self.wakes(wake_comment("Better Stack Workbench", "PR is up")))
+        self.assertFalse(self.wakes(wake_comment("Claude Terminals", "It is live")))
+        self.assertFalse(self.wakes(wake_comment("Better Stack", "Fatal App Hang", None)))
+
+    def test_simon_without_the_robot_wakes(self):
+        self.assertTrue(self.wakes(wake_comment("Šimon Let", "why is this broken?", "U1")))

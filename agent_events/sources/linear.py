@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -27,7 +28,7 @@ query($id: String!) {
   viewer { id name }
   issue(id: $id) {
     id identifier title description url priorityLabel estimate dueDate
-    state { name }
+    state { name type }
     assignee { id name }
     project { name }
     cycle { number name }
@@ -47,6 +48,8 @@ FIELDS = [  # (snapshot key, label)
     ("state", "status"), ("assignee", "assignee"), ("priority", "priority"), ("project", "project"),
     ("cycle", "cycle"), ("estimate", "estimate"), ("due", "due date"), ("parent", "parent"), ("title", "title"),
 ]
+JULIE = "Julie Blanchard"
+NOT_PEOPLE = ("Better Stack Workbench", "Claude Terminals")
 SELF_QA_HINT = ("Your issue reached Self QA: if your task built it, run the PM check now (linear skill: verify on "
                 "production, comment 🤖 PM:). Simple change: move it to PM review. Needs Simon's product taste: "
                 "leave it in Self QA and tell your parent.")
@@ -99,6 +102,7 @@ def snapshot(data: dict) -> dict:
         "id": issue["id"], "identifier": issue["identifier"], "url": issue["url"],
         "title": issue["title"], "description": issue.get("description") or "",
         "state": (issue.get("state") or {}).get("name"),
+        "state_type": (issue.get("state") or {}).get("type"),
         "assignee": (issue.get("assignee") or {}).get("name"),
         "priority": issue.get("priorityLabel"),
         "project": (issue.get("project") or {}).get("name"),
@@ -117,6 +121,18 @@ def thread_root(comments: dict, cid: str) -> str:
         seen.add(cid)
         cid = comments[cid]["parent"]
     return cid
+
+
+def wakes_stopped(c: dict, state_type: str | None) -> bool:
+    """Whether this new comment is worth resuming a stopped agent that follows the issue: a person's,
+    on an issue still open. Julie's reviews only when they raise a ⚠️ or 🚨; other agents never (they
+    sign with 🤖, on Simon's account or their own). Everything else waits for the agent's next turn."""
+    if state_type in ("completed", "canceled") or not c["author_id"] or c["author"] in NOT_PEOPLE:
+        return False
+    if c["author"] == JULIE:
+        verdict = c["body"].split("+++ Details")[0]
+        return "**⚠" in verdict or "**🚨" in verdict
+    return not c["body"].lstrip().startswith("🤖")
 
 
 def diff(old: dict, new: dict, topic: str) -> EventList:
@@ -143,8 +159,9 @@ def diff(old: dict, new: dict, topic: str) -> EventList:
         if prev is None:
             if old["truncated"] and c["created"] < min(o["created"] for o in old["comments"].values()):
                 continue  # an old comment that slid into the newest-250 window after a deletion
+            wake = {"wakes_stopped_at": time.time()} if wakes_stopped(c, new.get("state_type")) else {}
             ev.add("comment", f"{what} by {c['author']}", body=c["body"], url=c["url"], actor=c["author"],
-                   topic=where, dedupe=f"comment:{cid}", at=c["created"], **mine)
+                   topic=where, dedupe=f"comment:{cid}", at=c["created"], **mine, **wake)
         elif prev["hash"] != c["hash"]:
             ev.add("comment_edited", f"{what} by {c['author']} edited", body=c["body"], url=c["url"],
                    actor=c["author"], topic=where, at=c.get("updated"), **mine)
