@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 SCHEMA = """
@@ -307,6 +308,18 @@ class Store:
             if passes(terms, texts):
                 return True
         return False
+
+    def wakes(self, seen_after: float, since: float = 0) -> dict[str, int]:
+        """Agent -> pending comments flagged wakes_stopped_at, seen after `seen_after` and written
+        after `since`. Like `unread`, not counting news older than what the agent already got. A
+        filtered subscription doesn't count: it asked for less than everything on its topic."""
+        rows = self.q(f"SELECT s.agent_id AS agent, e.id AS id, e.data AS data FROM events e "
+                      f"CROSS JOIN subscriptions s JOIN agents a ON a.id = s.agent_id "
+                      f"LEFT JOIN events c ON c.id = a.cursor "
+                      f"WHERE e.data LIKE '%wakes_stopped_at%' AND {MATCH} AND e.id > s.since AND e.id > a.cursor "
+                      f"AND COALESCE(s.filter, '') = '' AND e.created_at >= MAX(?, COALESCE(c.created_at, 0))", (since,))
+        found = {(r["agent"], r["id"]) for r in rows if json.loads(r["data"]).get("wakes_stopped_at", 0) >= seen_after}
+        return dict(Counter(agent for agent, _ in found))
 
     def cursor_time(self, agent: str) -> float:
         """When the last event handed to the agent happened (0 if none is known)."""

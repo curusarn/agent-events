@@ -369,9 +369,7 @@ class Daemon:
         (the source's), the newest id and topics. For apps that remind about stopped agents; it
         does not touch the agents. `agents` limits the answer; `exclude` drops topic prefixes
         (Hyperfocus counts its own hf/ posts itself); `since` (epoch seconds) drops events that
-        happened before it; `events: N` also returns up to N of them (oldest first). `wakes` counts
-        the comments worth resuming a stopped agent for, first seen here in the last WAKE_WINDOW
-        (seen, not written: a comment that arrives after days offline still counts).
+        happened before it; `events: N` also returns up to N of them (oldest first).
 
         Not counted, since there is nothing in them to act on: source-health events ("polling is
         failing" / "works again"), and events that happened before the last one the agent was
@@ -390,14 +388,19 @@ class Daemon:
             if events:
                 out[agent] = {"count": len(events), "oldest": min(e["created_at"] for e in events),
                               "newest_id": max(e["id"] for e in events),
-                              "topics": sorted({e["topic"] for e in events})[:10],
-                              "wakes": sum((e.get("data") or {}).get("wakes_stopped_at", 0) >= time.time() - WAKE_WINDOW
-                                           for e in events)}
+                              "topics": sorted({e["topic"] for e in events})[:10]}
                 n = int(req.get("events") or 0)
                 if n > 0:
                     out[agent]["events"] = [{k: e[k] for k in ("id", "topic", "kind", "summary", "url", "actor",
                                                                 "created_at")} for e in events[:n]]
         return {"ok": True, "agents": out}
+
+    def op_wakes(self, req):
+        """Per agent, how many pending comments are worth resuming it for, stopped: first seen here
+        in the last WAKE_WINDOW (seen, not written: a comment that arrives after days offline still
+        counts) and written after `since`. Only reads the flagged comments, so an app can ask about
+        every agent each minute; `unread` loads each agent's whole backlog (16.8s for 75 agents)."""
+        return {"ok": True, "agents": self.store.wakes(time.time() - WAKE_WINDOW, float(req.get("since") or 0))}
 
     def op_unwatch(self, req):
         """End the agent's watches (its Claude Code session ended)."""
