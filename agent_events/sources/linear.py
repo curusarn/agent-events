@@ -23,10 +23,7 @@ OP_REF_ENV = "AGENT_EVENTS_LINEAR_OP_REF"
 # in ~/.agent-events/env.
 DEFAULT_OP_REF = None
 
-QUERY = """
-query($id: String!) {
-  viewer { id name }
-  issue(id: $id) {
+ISSUE_FIELDS = """
     id identifier title description url priorityLabel estimate dueDate
     state { name type }
     assignee { id name }
@@ -34,12 +31,25 @@ query($id: String!) {
     cycle { number name }
     parent { identifier }
     labels(first: 50) { nodes { name } }
-    comments(first: 250) {  # newest first
+    comments(first: 250) {
       nodes { id body url createdAt updatedAt user { id name } botActor { name } externalUser { name } parent { id } }
     }
-  }
-}
-"""
+"""  # comments come newest first
+
+
+def batch_query(n: int) -> str:
+    """One request for n issues ($i0..), each under its own alias (i0..). A poll costs Linear ~20 of
+    its 3M complexity points an hour, so requests (2,500 an hour per key) are what runs out."""
+    params = ", ".join(f"$i{j}: String!" for j in range(n))
+    issues = " ".join(f"i{j}: issue(id: $i{j}) {{{ISSUE_FIELDS}}}" for j in range(n))
+    return f"query({params}) {{ viewer {{ id name }} {issues} }}"
+
+
+# The key is shared: other hosts' daemons and every agent's and check's own Linear calls use it too.
+# Polling stops while it has fewer than this many requests left, so those keep working.
+RESERVE = config._float_env("AGENT_EVENTS_LINEAR_RESERVE", 500)
+HOLD = 300.0  # how long a spent budget stops polling before one request looks again
+CALLS: list[float] = []  # when this process sent each request in the last hour
 
 ISSUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 URL_RE = re.compile(r"^https?://linear\.app/[^/]+/issue/([A-Za-z][A-Za-z0-9]*-\d+)(?:/[^#?]*)?(?:\?[^#]*)?(?:#comment-([0-9a-f]+))?", re.I)
@@ -63,26 +73,62 @@ def api_key() -> str:
     return key
 
 
-def graphql(query: str, **variables) -> dict:
+def _hold(reason: str) -> None:
+    Linear.hold_until = time.time() + HOLD
+    Linear.hold_reason = reason
+
+
+def _note_budget(headers) -> None:
+    try:
+        left = int(headers.get("x-ratelimit-requests-remaining"))
+    except (TypeError, ValueError):
+        return
+    if left < RESERVE:
+        _hold(f"the Linear key has {left} requests left this hour, under the {RESERVE:.0f} kept for others")
+
+
+def request(query: str, variables: dict) -> tuple[dict | None, list]:
+    """One GraphQL request: (data, errors). Raises SourceError when there's no usable answer."""
     key = api_key()
     req = urllib.request.Request(API, data=json.dumps({"query": query, "variables": variables}).encode(), headers={
         "Content-Type": "application/json",
         # Personal API keys go in raw; OAuth tokens need the Bearer prefix.
         "Authorization": key if key.startswith("lin_api_") else f"Bearer {key}",
     })
+    now = time.time()
+    CALLS.append(now)
+    del CALLS[:sum(1 for t in CALLS if t < now - 3600)]
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
+            _note_budget(resp.headers)
             data = json.load(resp)
     except urllib.error.HTTPError as e:
+        _note_budget(e.headers)
         body = e.read().decode(errors="replace")[:400]
         if e.code in (401, 403):
             config.forget_secret(OP_REF_ENV, DEFAULT_OP_REF)
+        if e.code == 429 or "RATELIMITED" in body:
+            _hold("Linear answered 429 (rate limited)")
         raise SourceError(f"Linear API HTTP {e.code}: {body}") from None
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise SourceError(f"Linear API request failed: {e}") from None
-    if data.get("errors"):
-        raise SourceError("Linear: " + "; ".join(e.get("message", str(e)) for e in data["errors"])[:400])
-    return data["data"]
+    errors = data.get("errors") or []
+    if any((e.get("extensions") or {}).get("code") == "RATELIMITED" for e in errors):
+        _hold("Linear answered RATELIMITED")
+    if errors and not data.get("data") and not any(e.get("path") for e in errors):
+        raise SourceError(error_text(errors))
+    return data.get("data"), errors
+
+
+def error_text(errors: list) -> str:
+    return ("Linear: " + "; ".join(e.get("message", str(e)) for e in errors))[:400]
+
+
+def graphql(query: str, **variables) -> dict:
+    data, errors = request(query, variables)
+    if errors:
+        raise SourceError(error_text(errors))
+    return data
 
 
 def snapshot(data: dict) -> dict:
@@ -181,7 +227,8 @@ def describe(s: dict) -> str:
 class Linear(Source):
     type = "linear"
     interval = 60.0
-    min_spacing = 3.0  # 2500 requests/hour per API key, shared with the skills
+    min_spacing = 3.0  # per request: at most 1,200 an hour from this host, of the key's 2,500
+    batch = 20
     help = ("A Linear ticket (status, assignee, priority, project, labels, description, comments, ...), "
             "or just one comment thread in it")
     examples = ["linear/<ISSUE-ID>", "linear/<ISSUE-ID>/<thread-id>",
@@ -202,12 +249,62 @@ class Linear(Source):
         return parts[:1]
 
     def poll(self, key, state):
-        data = graphql(QUERY, id=key[0])
-        if not data.get("issue"):
-            raise SourceError(f"Linear issue {key[0]} not found")
-        new = snapshot(data)
-        events = diff(state, new, f"{self.type}/{key[0]}") if state else []
-        return PollResult(new, events, describe(new))
+        result = self.poll_batch([key], [state])[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def poll_batch(self, keys, states):
+        ids = [k[0] for k in keys]
+        try:
+            found, failed = self._fetch(ids)
+        except SourceError as e:
+            if len(ids) == 1 or "not found" not in str(e).lower():
+                raise
+            # A missing issue the answer doesn't point at: ask for each on its own, this once.
+            return [r for key, state in zip(keys, states) for r in Source.poll_batch(self, [key], [state])]
+        if failed and any(i not in found and i not in failed for i in ids):
+            # An issue that fails nulls the whole answer (it can't be null), so the others weren't
+            # read: ask again without it.
+            rest = [i for i in ids if i not in failed]
+            if rest:
+                more, also = self._fetch(rest)
+                found.update(more)
+                failed.update(also)
+        out = []
+        for key, state in zip(keys, states):
+            issue = found.get(key[0])
+            if issue is None:
+                why = failed.get(key[0], "")
+                out.append(SourceError(f"Linear issue {key[0]} not found" if not why or "not found" in why.lower()
+                                       else f"Linear: {why}"))
+                continue
+            new = snapshot({"viewer": found.get(None), "issue": issue})
+            events = diff(state, new, f"{self.type}/{key[0]}") if state else []
+            out.append(PollResult(new, events, describe(new)))
+        return out
+
+    @staticmethod
+    def _fetch(ids: list) -> tuple[dict, dict]:
+        """({id: issue, None: viewer}, {id: error message}) for one request. Raises SourceError when
+        the request failed as a whole."""
+        data, errors = request(batch_query(len(ids)), {f"i{j}": i for j, i in enumerate(ids)})
+        failed = {}
+        for e in errors:
+            path = e.get("path") or []
+            alias = str(path[0]) if path else ""
+            if alias[:1] == "i" and alias[1:].isdigit() and int(alias[1:]) < len(ids):
+                failed.setdefault(ids[int(alias[1:])], e.get("message", str(e)))
+        if errors and not failed:
+            raise SourceError(error_text(errors))
+        found = {i: (data or {}).get(f"i{j}") for j, i in enumerate(ids)}
+        found = {i: v for i, v in found.items() if v}
+        found[None] = (data or {}).get("viewer")
+        return found, failed
+
+    def requests_last_hour(self):
+        now = time.time()
+        return sum(1 for t in CALLS if t > now - 3600)
 
     def resolve(self, parts, state):
         if len(parts) == 1:

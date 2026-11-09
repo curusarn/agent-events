@@ -54,6 +54,12 @@ class Source:
     # Seconds of API budget one poll uses: with N active keys each is polled at most every
     # N * min_spacing seconds. Keeps many subscriptions from exhausting rate limits.
     min_spacing = 1.0
+    # Keys one request can poll together (poll_batch). Budgets count requests, not keys.
+    batch = 1
+    # Until when (epoch seconds) the source's API budget is spent, and why: the daemon polls none
+    # of its keys until then.
+    hold_until = 0.0
+    hold_reason = ""
     # Push sources are never polled: events are published into them (the `publish` op), and
     # subscribing needs no baseline.
     push = False
@@ -71,6 +77,20 @@ class Source:
 
     def poll(self, key: list[str], state: dict | None) -> PollResult:
         raise NotImplementedError
+
+    def poll_batch(self, keys: list[list[str]], states: list) -> list:
+        """Poll several keys (at most `batch`): a PollResult or the Exception, per key, in order."""
+        out = []
+        for key, state in zip(keys, states):
+            try:
+                out.append(self.poll(key, state))
+            except Exception as e:
+                out.append(e)
+        return out
+
+    def requests_last_hour(self) -> int | None:
+        """API requests this process made in the last hour, for sources that count them."""
+        return None
 
     def resolve(self, parts: list[str], state: dict) -> tuple[list[str], str]:
         """After a successful poll: final canonical segments + extra description.

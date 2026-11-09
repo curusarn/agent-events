@@ -69,6 +69,7 @@ class Daemon:
         self.started = time.time()
         self.version = config.LOADED_VERSION
         self.last_active: set[str] = set()  # poll keys found active by the last poller pass
+        self.holds_logged: dict[str, float] = {}  # source -> the hold last logged
 
     def notify(self) -> None:
         with self.cond:
@@ -79,41 +80,66 @@ class Daemon:
 
     def poll(self, key: str) -> None:
         """Poll one key and store the resulting events. Raises on failure."""
-        source = SOURCES[key.split("/", 1)[0]]
-        parts = key.split("/")[1:]
-        with self.key_locks[key]:
-            target = self.store.target(key)
-            state = json.loads(target["state"]) if target and target["state"] else None
+        failures = self.poll_many([key])
+        if failures:
+            raise failures[0][1]
+
+    def poll_many(self, keys: list[str]) -> list[tuple[str, Exception]]:
+        """Poll keys of one source, in one request where it can (Source.batch), and store each
+        key's events or failure. Returns the failures."""
+        source = SOURCES[keys[0].split("/", 1)[0]]
+        locks = [self.key_locks[k] for k in sorted(set(keys))]
+        for lock in locks:
+            lock.acquire()
+        try:
+            targets = [self.store.target(k) for k in keys]
+            states = [json.loads(t["state"]) if t and t["state"] else None for t in targets]
+            parts = [k.split("/")[1:] for k in keys]
             try:
-                result = source.poll(parts, state)
+                results = source.poll_batch(parts, states) if len(keys) > 1 else [source.poll(parts[0], states[0])]
             except Exception as e:
-                msg = str(e) or type(e).__name__
-                if not isinstance(e, SourceError):
-                    log(f"poll {key} crashed:\n{traceback.format_exc()}")
-                fails = (target["fails"] if target else 0) + 1
-                interval = self.interval(source)
-                events = []
-                if state is not None and fails == ERROR_REPORT_AFTER:
-                    events.append(Event(key, "error", f"polling is failing: {msg}", dedupe=f"error@{time.time()}"))
-                self.store.save_error(key, msg, fails, time.time() + min(interval * 2 ** min(fails, 6), 900), events)
-                if events:
-                    self.notify()
-                raise
-            events = list(result.events) if state is not None else []
-            if target and target["fails"] >= ERROR_REPORT_AFTER:
-                events.append(Event(key, "recovered", "polling works again", dedupe=f"recovered@{time.time()}"))
+                results = [e] * len(keys)
             interval = self.interval(source)
-            if self.store.save_poll(key, result.state, result.summary, time.time() + interval, events):
-                self.notify()
-            if events:
-                log(f"{key}: {len(events)} event(s)")
+            failures = []
+            for key, target, state, result in zip(keys, targets, states, results):
+                if isinstance(result, Exception):
+                    failures.append((key, result))
+                    self._failed(key, target, state, result, interval)
+                else:
+                    self._polled(key, target, state, result, interval)
+            return failures
+        finally:
+            for lock in locks:
+                lock.release()
+
+    def _failed(self, key, target, state, e: Exception, interval: float) -> None:
+        msg = str(e) or type(e).__name__
+        if not isinstance(e, SourceError):
+            log(f"poll {key} crashed:\n{''.join(traceback.format_exception(type(e), e, e.__traceback__))}")
+        fails = (target["fails"] if target else 0) + 1
+        events = []
+        if state is not None and fails == ERROR_REPORT_AFTER:
+            events.append(Event(key, "error", f"polling is failing: {msg}", dedupe=f"error@{time.time()}"))
+        self.store.save_error(key, msg, fails, time.time() + min(interval * 2 ** min(fails, 6), 900), events)
+        if events:
+            self.notify()
+
+    def _polled(self, key, target, state, result, interval: float) -> None:
+        events = list(result.events) if state is not None else []
+        if target and target["fails"] >= ERROR_REPORT_AFTER:
+            events.append(Event(key, "recovered", "polling works again", dedupe=f"recovered@{time.time()}"))
+        if self.store.save_poll(key, result.state, result.summary, time.time() + interval, events):
+            self.notify()
+        if events:
+            log(f"{key}: {len(events)} event(s)")
 
     def interval(self, source) -> float:
         """Poll interval for one key of this source, stretched so that all active keys of the
         source together stay within its API budget (min_spacing seconds between requests)."""
         base = config.poll_interval(source.type, source.interval)
         n = sum(1 for k in self.last_active if k.split("/", 1)[0] == source.type)
-        return max(base, n * source.min_spacing)
+        requests = -(-n // max(1, source.batch))
+        return max(base, requests * source.min_spacing)
 
     def alive_agents(self) -> set[str]:
         now = time.time()
@@ -141,16 +167,47 @@ class Daemon:
                 keys.add(poll_key(source, parts))
         return keys
 
-    def _poll_bg(self, key: str) -> None:
+    def _poll_bg(self, keys: list[str]) -> None:
         try:
             if self.stop.is_set():
                 return
-            self.poll(key)
-        except Exception as e:
-            log(f"poll {key} failed: {e}")
+            for key, e in self.poll_many(keys):
+                log(f"poll {key} failed: {e}")
+        except Exception:
+            log(f"poll {keys} crashed:\n{traceback.format_exc()}")
         finally:
             with self.inflight_lock:
-                self.inflight.discard(key)
+                self.inflight.difference_update(keys)
+
+    def due_batches(self, now: float) -> list[list[str]]:
+        """Groups of active keys to poll now, one request each. A source that polls several keys in
+        one request polls all its keys that work whenever one of them is due, so they share their
+        next poll and a round takes ceil(keys / batch) requests. Failing keys keep their own backoff."""
+        targets = self.store.targets()
+        by_source: dict[str, list[str]] = defaultdict(list)
+        for key in sorted(self.last_active):
+            source = SOURCES.get(key.split("/", 1)[0])
+            if source and source.hold_until <= now:
+                by_source[source.type].append(key)
+            elif source and self.holds_logged.get(source.type) != source.hold_until:
+                self.holds_logged[source.type] = source.hold_until
+                log(f"{source.type}: polling paused until {time.strftime('%H:%M:%S', time.localtime(source.hold_until))}: "
+                    f"{source.hold_reason}")
+        batches = []
+        with self.inflight_lock:
+            for stype, keys in by_source.items():
+                keys = [k for k in keys if k not in self.inflight]
+                due = [k for k in keys if k not in targets or targets[k]["next_poll"] <= now]
+                if not due:
+                    continue
+                size = max(1, SOURCES[stype].batch)
+                healthy = [k for k in keys if k in targets and not targets[k]["fails"]]
+                if size > 1 and any(k not in targets or not targets[k]["fails"] for k in due):
+                    due = sorted(set(due) | set(healthy))
+                for i in range(0, len(due), size):
+                    batches.append(due[i:i + size])
+                    self.inflight.update(due[i:i + size])
+        return batches
 
     def poller(self) -> None:
         pool = ThreadPoolExecutor(max_workers=4)
@@ -162,17 +219,9 @@ class Daemon:
                 if now - last_maintenance > 600:
                     last_maintenance = now
                     self.maintenance()
-                targets = self.store.targets()
                 self.last_active = self.active_keys()
-                for key in self.last_active:
-                    t = targets.get(key)
-                    if t and t["next_poll"] > now:
-                        continue
-                    with self.inflight_lock:
-                        if key in self.inflight:
-                            continue
-                        self.inflight.add(key)
-                    pool.submit(self._poll_bg, key)
+                for batch in self.due_batches(now):
+                    pool.submit(self._poll_bg, batch)
             except Exception:
                 log(f"poller loop error:\n{traceback.format_exc()}")
             self.stop.wait(1)
@@ -187,6 +236,10 @@ class Daemon:
                 log(f"forgetting agent {a['id']} (inactive since {time.ctime(a['last_seen'])})")
                 self.store.delete_agent(a["id"])
         self.store.prune_events(now - config.EVENT_TTL)
+        for source in SOURCES.values():
+            n = source.requests_last_hour()
+            if n:
+                log(f"{source.type}: {n} requests in the last hour")
         wanted = set()
         for s in self.store.all_subs():
             try:
@@ -499,8 +552,10 @@ class Daemon:
                            "subscriptions": [s["topic"] for s in subs if s["agent_id"] == a["id"]]})
         targets = [{"key": k, "summary": t["summary"], "last_poll": t["last_poll"], "error": t["error"],
                     "next_poll_in": max(0, (t["next_poll"] or 0) - now)} for k, t in self.store.targets().items()]
+        requests = {s.type: n for s in SOURCES.values() if (n := s.requests_last_hour()) is not None}
         return {"ok": True, "pid": os.getpid(), "started": self.started, "version": self.version,
-                "agents": agents, "targets": targets, "active_keys": sorted(self.active_keys())}
+                "agents": agents, "targets": targets, "active_keys": sorted(self.active_keys()),
+                "requests_last_hour": requests}
 
     def op_shutdown(self, req):
         log("shutdown requested")

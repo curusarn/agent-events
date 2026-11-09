@@ -87,6 +87,8 @@ an app which agents have something waiting. When a newer session of the same Cla
 replaces one (e.g. after /clear), the old session's subscriptions move to the new one: it is the
 same agent continuing. After 30 days of inactivity an agent and its subscriptions are dropped.
 
+Linear issues are polled 20 to a request, all of a host's together once a minute, since a Linear key allows 2,500 requests an hour and several machines' daemons, agents and checks may share one. The daemon logs how many it sent in the last hour every 10 minutes (`status` has it too), and stops polling Linear for 5 minutes whenever the key has fewer than `AGENT_EVENTS_LINEAR_RESERVE` (500) requests left, so the others keep working.
+
 Override poll intervals with `AGENT_EVENTS_POLL_GITHUB=30` and similar. GitHub checks whose name matches
 `AGENT_EVENTS_IGNORE_CHECKS` (a regex, default `\(shadow\)`: shadow CI runs beside the real one; empty
 turns it off) give no events and are left out of the pass/fail counts and the overall CI result. Put these, or tokens

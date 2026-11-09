@@ -15,6 +15,7 @@ from unittest import mock
 from helpers import DaemonTest
 
 from agent_events import cli, client, config
+from agent_events.sources import Source
 
 
 def watch_raw(agent, timeout=5.0, ack=True, passive=False):
@@ -427,6 +428,59 @@ class IntervalTests(DaemonTest):
         self.assertEqual(self.daemon.interval(self.fake), 0.5)  # max(0.2 base, 1 * 0.5)
         self.daemon.last_active = {f"fake/{i}" for i in range(10)} | {"github/o/r/1"}
         self.assertEqual(self.daemon.interval(self.fake), 5.0)
+
+
+class BatchTests(DaemonTest):
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        fake = self.fake
+
+        def poll_batch(keys, states):
+            self.calls.append(sorted(k[0] for k in keys))
+            return Source.poll_batch(fake, keys, states)
+        self.fake.poll_batch = poll_batch
+        self.fake.batch = 3
+        self.fake.interval = 1.5
+        for t in "abcdefg":
+            self.fake.things[t] = {"version": 1, "events": []}
+
+    def test_due_keys_go_together_and_stay_together(self):
+        for t in "abcdefg":
+            self.assertTrue(self.req(op="subscribe", agent="ag", topic=f"fake/{t}")["ok"])
+        self.calls.clear()  # each subscribe polled its own key
+        g = self.fake.polls["g"]
+        self.assertTrue(self.wait_for(lambda: len(self.calls) >= 6, timeout=10), self.calls)
+        self.assertEqual(self.interval_requests(), 3)  # 7 keys in groups of 3
+        # The first round lines them up: then a round is abc, def, and g on its own (a plain poll).
+        self.assertEqual(self.calls[2:6], [list("abc"), list("def")] * 2)
+        self.assertGreaterEqual(self.fake.polls["g"], g + 2)
+
+    def interval_requests(self):
+        self.fake.min_spacing = 1.0
+        try:
+            return self.daemon.interval(self.fake)
+        finally:
+            self.fake.min_spacing = 0.01
+
+    def test_a_spent_budget_stops_polling(self):
+        self.assertTrue(self.req(op="subscribe", agent="ag", topic="fake/a")["ok"])
+        self.fake.hold_until = time.time() + 60
+        self.addCleanup(setattr, self.fake, "hold_until", 0.0)
+        before = dict(self.fake.polls)
+        time.sleep(2.5)
+        self.assertEqual(self.fake.polls, before)
+        self.fake.hold_until = 0.0
+        self.assertTrue(self.wait_for(lambda: self.fake.polls.get("a", 0) > before.get("a", 0)))
+
+    def test_one_failing_key_fails_alone(self):
+        for t in "abc":
+            self.req(op="subscribe", agent="ag", topic=f"fake/{t}")
+        self.fake.fail.add("b")
+        self.req(op="refresh", agent="ag")
+        self.assertTrue(self.wait_for(lambda: (self.daemon.store.target("fake/b")["fails"] or 0) >= 1))
+        self.assertEqual(self.daemon.store.target("fake/a")["fails"], 0)
+        self.assertEqual(self.daemon.store.target("fake/c")["fails"], 0)
 
 
 class CliTest(DaemonTest):

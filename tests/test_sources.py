@@ -642,3 +642,63 @@ class LinearWakesStoppedTest(unittest.TestCase):
 
     def test_simon_without_the_robot_wakes(self):
         self.assertTrue(self.wakes(wake_comment("Šimon Let", "why is this broken?", "U1")))
+
+
+def lin_issue(ident):
+    return {"id": ident.lower(), "identifier": ident, "title": "t", "description": "", "url": f"https://linear.app/x/issue/{ident}",
+            "priorityLabel": None, "estimate": None, "dueDate": None, "state": {"name": "Todo", "type": "unstarted"},
+            "assignee": None, "project": None, "cycle": None, "parent": None, "labels": {"nodes": []},
+            "comments": {"nodes": []}}
+
+
+class LinearBatchTests(unittest.TestCase):
+    def test_several_issues_in_one_request(self):
+        sent = []
+
+        def request(query, variables):
+            sent.append(variables)
+            return {"viewer": {"id": "U1"}, **{f"i{j}": lin_issue(v) for j, v in enumerate(variables.values())}}, []
+        with mock.patch.object(linear, "request", request):
+            got = linear.Linear().poll_batch([["T-1"], ["T-2"]], [None, None])
+        self.assertEqual(sent, [{"i0": "T-1", "i1": "T-2"}])
+        self.assertEqual([r.state["identifier"] for r in got], ["T-1", "T-2"])
+
+    def test_a_missing_issue_fails_alone(self):
+        sent = []
+
+        def request(query, variables):
+            sent.append(list(variables.values()))
+            ids = list(variables.values())
+            if "T-404" in ids:  # it nulls the whole answer
+                return None, [{"message": "Entity not found: Issue", "path": [f"i{ids.index('T-404')}"]}]
+            return {"viewer": {"id": "U1"}, **{f"i{j}": lin_issue(v) for j, v in enumerate(ids)}}, []
+        with mock.patch.object(linear, "request", request):
+            got = linear.Linear().poll_batch([["T-1"], ["T-404"], ["T-2"]], [None, None, None])
+        self.assertEqual(sent, [["T-1", "T-404", "T-2"], ["T-1", "T-2"]])
+        self.assertEqual(got[0].state["identifier"], "T-1")
+        self.assertIsInstance(got[1], linear.SourceError)
+        self.assertIn("not found", str(got[1]))
+        self.assertEqual(got[2].state["identifier"], "T-2")
+
+    def test_few_requests_left_pause_polling(self):
+        self.addCleanup(setattr, linear.Linear, "hold_until", 0.0)
+        linear._note_budget({"x-ratelimit-requests-remaining": "2000"})
+        self.assertEqual(linear.Linear.hold_until, 0.0)
+        linear._note_budget({"x-ratelimit-requests-remaining": "120"})
+        self.assertGreater(linear.Linear.hold_until, time.time() + 200)
+        self.assertIn("120 requests left", linear.Linear.hold_reason)
+
+    def test_an_unplaced_missing_issue_splits_the_request(self):
+        sent = []
+
+        def request(query, variables):
+            ids = list(variables.values())
+            sent.append(ids)
+            if "T-404" in ids:
+                raise linear.SourceError("Linear: Entity not found: Issue")
+            return {"viewer": {"id": "U1"}, **{f"i{j}": lin_issue(v) for j, v in enumerate(ids)}}, []
+        with mock.patch.object(linear, "request", request):
+            got = linear.Linear().poll_batch([["T-1"], ["T-404"]], [None, None])
+        self.assertEqual(sent, [["T-1", "T-404"], ["T-1"], ["T-404"]])
+        self.assertEqual(got[0].state["identifier"], "T-1")
+        self.assertIsInstance(got[1], linear.SourceError)
