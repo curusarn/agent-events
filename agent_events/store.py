@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import threading
 import time
 from collections import Counter
 from pathlib import Path
+
+from .locks import TimedRLock
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -104,7 +105,7 @@ class Store:
             self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.readonly = readonly
-        self.lock = threading.RLock()
+        self.lock = TimedRLock()  # a lost wakeup on this lock stopped all polling for 16 h (2026-11-18)
         if not readonly:
             with self.lock:
                 self.db.executescript(SCHEMA)

@@ -139,6 +139,15 @@ minutes (`AGENT_EVENTS_SECRET_RETRY`), since it may ask for Touch ID each time.
   running older code.
 - A source that fails 3 polls in a row sends its subscribers an `error` event, then a `recovered`
   event when polling works again. Retries back off exponentially, up to 15 minutes.
+- A watchdog checks every 30 s that polling still runs: the poller loop must go round within 3
+  minutes (`AGENT_EVENTS_STALL`) and no poll may run past 15 (`AGENT_EVENTS_POLL_STALL`). If one does,
+  it logs every thread's Python stack, starts a new poller thread in the same process (a restarted
+  daemon would read its tokens again, which 1Password refuses while the operator is away), and posts
+  to the orchestrator with `hf post --to orchestrator` as the job `agent-events`, at most once an hour
+  (`AGENT_EVENTS_ALERT_CMD`, a shell command reading the text on stdin, posts elsewhere). A poll that
+  waits over a minute for a stuck poll of the same key fails and backs off. The daemon's locks never
+  wait forever (`agent_events/locks.py`): its poller once waited 16 hours on the store lock for a wakeup
+  that never came, while other threads used that lock.
 - Events authored by your own account (the `gh` viewer, the Linear API key's user, the Slack token's
   user) are tagged `(you)`. Agents act as you, so these are often their own actions echoing back.
 
@@ -176,6 +185,7 @@ agent_events/cli.py          commands, output formatting, hook, install
 agent_events/client.py       socket client, daemon auto-start / restart / stop
 agent_events/daemon.py       socket server, poller, watch delivery
 agent_events/store.py        SQLite schema and queries (~/.agent-events/events.db)
+agent_events/locks.py        the lock every daemon lock uses: waits are timed and retried
 agent_events/sources/        one module per event type (base.py has the contract)
 skills/events/SKILL.md       the /events skill for agents
 tests/                       python3 -m unittest (see CLAUDE.md)

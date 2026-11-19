@@ -16,9 +16,11 @@ import fcntl
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +30,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from . import config
+from .locks import TimedRLock
 from .sources import SOURCES, Event, SourceError, TopicError, is_push, matches, parse, poll_key
 from .store import Store, is_quiet
 
@@ -36,10 +39,30 @@ HEALTH_KINDS = ("error", "recovered")
 # Consecutive failures before subscribers are told polling is broken (single blips are noise).
 WAKE_WINDOW = 24 * 3600
 ERROR_REPORT_AFTER = 3
+# The watchdog: the poller loop goes round every second, and no poll takes longer than an `op read`
+# Approve (340 s) plus its request. Past these, polling has stopped (2026-11-18: 16 hours unnoticed).
+STALL = config._float_env("AGENT_EVENTS_STALL", 180)  # the poller loop made no round for this long
+POLL_STALL = config._float_env("AGENT_EVENTS_POLL_STALL", 900)  # one poll has been running this long
+WATCHDOG_EVERY = config._float_env("AGENT_EVENTS_WATCHDOG_EVERY", 30)
+KEY_WAIT = config._float_env("AGENT_EVENTS_KEY_WAIT", 60)  # a poll waits this long for one of the same key
+ALERT_EVERY = 3600.0  # at most one post to the orchestrator an hour, however often polling stalls
 
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", file=sys.stderr, flush=True)
+
+
+def duration(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
+def thread_stacks() -> str:
+    """Every thread's Python stack, for the log when polling stalls."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for ident, frame in sys._current_frames().items():
+        out.append(f"--- thread {names.get(ident, ident)}\n{''.join(traceback.format_stack(frame)).rstrip()}")
+    return "\n".join(out)
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -57,19 +80,23 @@ def pid_alive(pid: int | None) -> bool:
 class Daemon:
     def __init__(self):
         self.store = Store(config.db_path())
-        self.cond = threading.Condition()
+        self.cond = threading.Condition(TimedRLock())
         self.generation = 0  # bumped whenever events or subscriptions change
         self.watchers: dict[str, object] = {}  # agent -> token of the watch that delivers its events
         self.passive: dict[str, object] = {}  # agent -> token of its newest passive (hook) watch
         self.inflight_batches: set[str] = set()  # agents with a batch sent to a watch but not yet acked
-        self.key_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
-        self.inflight: set[str] = set()
-        self.inflight_lock = threading.Lock()
+        self.key_locks: dict[str, TimedRLock] = defaultdict(TimedRLock)
+        self.inflight: dict[str, float] = {}  # poll key -> when its poll was handed to a worker
+        self.inflight_lock = TimedRLock()
         self.stop = threading.Event()
         self.started = time.time()
         self.version = config.LOADED_VERSION
         self.last_active: set[str] = set()  # poll keys found active by the last poller pass
         self.holds_logged: dict[str, float] = {}  # source -> the hold last logged
+        self.poller_gen = 0  # the poller thread whose generation this is runs; an older one quits
+        self.poller_beat = time.time()  # when the poller loop last went round
+        self.stalls: list[float] = []  # when the watchdog found polling stopped
+        self.last_alert = 0.0
 
     def notify(self) -> None:
         with self.cond:
@@ -88,9 +115,19 @@ class Daemon:
         """Poll keys of one source, in one request where it can (Source.batch), and store each
         key's events or failure. Returns the failures."""
         source = SOURCES[keys[0].split("/", 1)[0]]
-        locks = [self.key_locks[k] for k in sorted(set(keys))]
-        for lock in locks:
-            lock.acquire()
+        locks = []
+        for k in sorted(set(keys)):
+            lock = self.key_locks[k]
+            if not lock.acquire(timeout=KEY_WAIT):  # a poll of k is stuck: fail these and back off
+                for held in locks:
+                    held.release()
+                e = SourceError(f"an earlier poll of {k} is still running after {duration(KEY_WAIT)} of waiting")
+                for key in keys:
+                    target = self.store.target(key)
+                    state = json.loads(target["state"]) if target and target["state"] else None
+                    self._failed(key, target, state, e, self.interval(source))
+                return [(key, e) for key in keys]
+            locks.append(lock)
         try:
             targets = [self.store.target(k) for k in keys]
             states = [json.loads(t["state"]) if t and t["state"] else None for t in targets]
@@ -177,7 +214,8 @@ class Daemon:
             log(f"poll {keys} crashed:\n{traceback.format_exc()}")
         finally:
             with self.inflight_lock:
-                self.inflight.difference_update(keys)
+                for k in keys:
+                    self.inflight.pop(k, None)
 
     def due_batches(self, now: float) -> list[list[str]]:
         """Groups of active keys to poll now, one request each. A source that polls several keys in
@@ -206,13 +244,23 @@ class Daemon:
                     due = sorted(set(due) | set(healthy))
                 for i in range(0, len(due), size):
                     batches.append(due[i:i + size])
-                    self.inflight.update(due[i:i + size])
+                    self.inflight.update(dict.fromkeys(due[i:i + size], now))
         return batches
 
-    def poller(self) -> None:
+    def start_poller(self) -> None:
+        """Start a poller thread, with its own pool of poll workers. A poller started before it quits
+        when it next goes round, so a stuck one that wakes up again doesn't poll twice."""
+        self.poller_gen += 1
+        self.poller_beat = time.time()
+        threading.Thread(target=self.poller, args=(self.poller_gen,), name=f"poller-{self.poller_gen}",
+                         daemon=True).start()
+
+    def poller(self, gen: int | None = None) -> None:
+        gen = self.poller_gen if gen is None else gen
         pool = ThreadPoolExecutor(max_workers=4)
         last_maintenance = 0.0
-        while not self.stop.is_set():
+        while not self.stop.is_set() and gen == self.poller_gen:
+            self.poller_beat = time.time()
             try:
                 config.load_env_file()
                 now = time.time()
@@ -226,6 +274,76 @@ class Daemon:
                 log(f"poller loop error:\n{traceback.format_exc()}")
             self.stop.wait(1)
         pool.shutdown(wait=False, cancel_futures=True)
+
+    # --- watchdog -------------------------------------------------------------------
+
+    def watchdog(self) -> None:
+        while not self.stop.wait(WATCHDOG_EVERY):
+            try:
+                self.check_stall()
+            except Exception:
+                log(f"watchdog error:\n{traceback.format_exc()}")
+
+    def check_stall(self) -> str | None:
+        """If polling stopped (the poller loop silent for STALL, or a poll running for POLL_STALL),
+        start a new poller thread in this process and tell the orchestrator. The daemon itself is not
+        restarted: a new process reads its tokens again, and 1Password refuses that while the operator
+        is away or the Mac is locked. Returns what stalled, or None."""
+        now = time.time()
+        silent = now - self.poller_beat
+        stuck = []
+        if self.inflight_lock.acquire(timeout=10):  # the watchdog itself must never hang on a lock
+            try:
+                stuck = sorted(k for k, t in self.inflight.items() if now - t > POLL_STALL)
+                for k in stuck:
+                    self.inflight.pop(k, None)  # due again; the new poller's polls of it wait KEY_WAIT at most
+            finally:
+                self.inflight_lock.release()
+        if silent <= STALL and not stuck:
+            return None
+        if silent > STALL:
+            what = (f"the poller loop made no round for {duration(silent)} "
+                    f"(since {time.strftime('%H:%M', time.localtime(self.poller_beat))})")
+        else:
+            what = (f"{len(stuck)} poll(s) running for over {duration(POLL_STALL)} "
+                    f"({', '.join(stuck[:3])}{', …' if len(stuck) > 3 else ''})")
+        self.stalls = [t for t in self.stalls if now - t < 86400] + [now]
+        stacks = thread_stacks()
+        log(f"watchdog: polling stopped: {what}; starting a new poller thread\n{stacks}")
+        self.start_poller()
+        if now - self.last_alert >= ALERT_EVERY:
+            self.last_alert = now
+            again = (f" Polling stopped {len(self.stalls)} times in 24 h: if a new poller doesn't help, the daemon "
+                     f"needs a restart, done only while the operator is at the Mac (a restart reads the tokens again)."
+                     if len(self.stalls) > 1 else "")
+            self.alert(f"agent-events on {socket.gethostname()}: polling had stopped: {what}. The daemon started a "
+                       f"new poller thread by itself (no daemon restart, tokens kept), so polls resume within a minute."
+                       f"{again} Python stacks of the stuck threads are in {config.log_path()}.")
+        return what
+
+    def alert(self, text: str) -> None:
+        """Post to the orchestrator: AGENT_EVENTS_ALERT_CMD (a shell command, the text on stdin), else
+        Hyperfocus's `hf post --to orchestrator` where hf is installed, posting as the job agent-events."""
+        cmd = os.environ.get("AGENT_EVENTS_ALERT_CMD")
+        hf = shutil.which("hf") or str(config.home().parent / ".hyperfocus" / "bin" / "hf")
+        if cmd:
+            args, shell = cmd, True
+        elif os.access(hf, os.X_OK):
+            args, shell = [hf, "post", "--to", "orchestrator", "--file", "-"], False
+        else:
+            log(f"alert (nowhere to post it): {text}")
+            return
+        env = dict(config.daemon_env(), HF_JOB="agent-events")
+
+        def send():
+            try:
+                out = subprocess.run(args, shell=shell, input=text, capture_output=True, text=True, env=env,
+                                     timeout=60)
+                log(f"alert posted: {text}" if out.returncode == 0 else
+                    f"alert failed ({out.returncode}): {(out.stderr or out.stdout).strip()[:300]}")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"alert failed: {e}")
+        threading.Thread(target=send, name="alert", daemon=True).start()
 
     def maintenance(self) -> None:
         now = time.time()
@@ -748,8 +866,8 @@ def run(wait_lock: bool = False) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
-    poller = threading.Thread(target=daemon.poller, name="poller", daemon=True)
-    poller.start()
+    daemon.start_poller()
+    threading.Thread(target=daemon.watchdog, name="watchdog", daemon=True).start()
     log(f"agent-events daemon started (pid {os.getpid()}, socket {sock}, db {config.db_path()})")
     try:
         server.serve_forever(poll_interval=0.5)
