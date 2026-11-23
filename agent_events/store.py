@@ -352,9 +352,15 @@ class Store:
 
     def pending(self, agent: str, limit: int = 100) -> list[dict]:
         def page(after: int | None) -> list:
+            # From each subscription's topics (a range of the (topic, dedupe) index), not from the
+            # cursor on: every watch runs this on each new event, and an agent whose cursor FYI
+            # events hold back made it match its subscriptions against every event since then
+            # (0.5s for one agent, 15s for all; the Mac's daemon sat at 95% CPU, 2026-11-23).
             return self.q(
-                f"SELECT e.* FROM events e WHERE e.id > COALESCE(:after, (SELECT cursor FROM agents WHERE id = :a)) "
-                f"AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.agent_id = :a AND e.id > s.since AND {MATCH}) "
+                f"SELECT e.* FROM events e WHERE e.id IN (SELECT e.id FROM subscriptions s JOIN events e "
+                f"ON e.topic >= s.topic AND e.topic < s.topic || '0' "  # '0' sorts right after '/'
+                f"WHERE s.agent_id = :a AND e.id > s.since AND {MATCH} "
+                f"AND e.id > COALESCE(:after, (SELECT cursor FROM agents WHERE id = :a))) "
                 f"ORDER BY e.id LIMIT :n", {"a": agent, "after": after, "n": limit})
         rows = page(None)
         subs = self.subs(agent)
