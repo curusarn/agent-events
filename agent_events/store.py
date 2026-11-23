@@ -229,11 +229,13 @@ class Store:
             return events
         for e in events:
             e.pop("held_until", None)
+            e.pop("due_at", None)
             if is_quiet(e) or is_urgent(e):
                 continue
             waits = [s["wait"] for s in subs if e["id"] > s["since"] and _matches(s["topic"], e["topic"])]
             if waits and all(waits):
                 due = (e.get("seen_at") or e["created_at"]) + min(waits)
+                e["due_at"] = due  # when it was meant to wake the agent
                 if due > now:
                     e["held_until"] = due
         return events

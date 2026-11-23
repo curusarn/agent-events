@@ -877,6 +877,15 @@ class WaitTests(CliTest):
         # A turn that starts anyway (a prompt) gets them.
         self.assertEqual([e["summary"] for e in self.req(op="take", agent="ag")["events"]], ["held"])
 
+    def test_unread_counts_a_held_event_from_when_its_wait_ended(self):
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=0.5)
+        self.publish("held")
+        self.daemon.store.x("UPDATE events SET created_at = created_at - 1800")  # posted 30 min ago
+        self.assertEqual(self.req(op="unread")["agents"], {})
+        time.sleep(0.6)
+        oldest = self.req(op="unread")["agents"]["ag"]["oldest"]
+        self.assertGreater(oldest, time.time() - 5, "counted from when it was posted")
+
     def test_clearing_the_wait_delivers_what_it_held(self):
         self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=60)
         self.publish("held")

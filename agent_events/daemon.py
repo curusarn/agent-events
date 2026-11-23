@@ -611,6 +611,7 @@ class Daemon:
         (Hyperfocus counts its own hf/ posts itself); `since` (epoch seconds) drops events that
         happened before it; `events: N` also returns up to N of them (oldest first).
 
+        Events a wait held back count from when it ended (their due time), not when they happened.
         Not counted, since there is nothing in them to act on: source-health events ("polling is
         failing" / "works again"), and events that happened before the last one the agent was
         handed (late, out-of-order arrivals of old news)."""
@@ -626,7 +627,11 @@ class Daemon:
                       if wakes_agent(e) and e["kind"] not in HEALTH_KINDS
                       and not (exclude and e["topic"].startswith(exclude)) and e["created_at"] >= floor]
             if events:
-                out[agent] = {"count": len(events), "oldest": min(e["created_at"] for e in events),
+                # A held event has waited only since its wait ended: Hyperfocus's idle check
+                # (WakeWatch) nudges an agent once its oldest event is 3 minutes old, and held
+                # ones came due looking 30 minutes old, before the hook could deliver them.
+                out[agent] = {"count": len(events), "oldest": min(max(e["created_at"], e.get("due_at") or 0)
+                                                                  for e in events),
                               "newest_id": max(e["id"] for e in events),
                               "topics": sorted({e["topic"] for e in events})[:10]}
                 n = int(req.get("events") or 0)
