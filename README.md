@@ -44,6 +44,7 @@ agent-events subscribe https://github.com/owner/repo/pull/12   # or github/owner
 agent-events subscribe linear/T-123 linear/T-123/5c3bf24b      # ticket; one comment thread
 agent-events subscribe 'https://x.slack.com/archives/C0123/p1712345678123456'   # thread
 agent-events subscribe slack/C0123 --mine --about 'welcome email'     # a busy channel: only my PRs, or these words
+agent-events wait slack/C0123 10m  # batch a busy subscription: one wake for all of it, 10 min after the first; `off` undoes
 agent-events list                  # this agent's subscriptions, poll status, is a watch running
 agent-events watch                 # block until events arrive, print them, exit (not needed with the hooks)
 agent-events watch --follow        # keep running, print each batch as it arrives (e.g. under Monitor)
@@ -126,6 +127,15 @@ minutes (`AGENT_EVENTS_SECRET_RETRY`), since it may ask for Touch ID each time.
   words, any case) reach the agent; `--mine` adds `repo#N`, `pull/N` and `#N` for each PR the agent is
   subscribed to. A reply in a thread counts when the thread's first message does. Other events are
   skipped (the cursor moves past them). Subscribing again without them delivers everything again.
+- Waits (`agent-events wait <topic> 10m`, `subscribe --wait`): a subscription's events don't wake the
+  agent until the wait has passed since each arrived; then they all come in one wake, in order. Anything
+  else that wakes it sooner brings them along, and `take` (a prompt starting a turn) and the stopped-agent
+  ops (`unread`, `wakes`) leave held ones alone until due. Never held: events flagged `urgent` in their data
+  (Hyperfocus sets it on posts from the operator, addressed to the agent, `--important`, questions,
+  blockers), and, from an older Hyperfocus, posts whose actor is the human operator or that start with
+  BLOCKED. Every wake is counted per subscription (`wakes` table); one without a wait that woke its agent
+  `AGENT_EVENTS_BUSY_WAKES` (6) times in the last hour gets a note in the delivery offering the wait (or,
+  for polled topics, narrowing or dropping it), at most once an hour.
 - `{"op": "transfer", "from": <agent>, "to": <agent>, "move": true}` hands one conversation's
   subscriptions (filters included, push topics not) to another, e.g. when Hyperfocus continues an
   agent in a fresh conversation. Without "move" the old one keeps them too.

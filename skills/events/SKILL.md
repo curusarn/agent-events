@@ -53,6 +53,11 @@ you're subscribed to: `repo#N`, `pull/N`, `#N`), plus `--about 'word,other words
 marks your work. Replies in a thread come along when its first message matched. Without a filter every
 other team's deploy wakes you.
 
+**Batching a busy subscription:** `agent-events wait <topic> 10m` (or `subscribe … --wait 10m`) wakes you once
+for everything from it, in order, 10 minutes after the first event; `agent-events wait <topic> off` undoes it.
+Posts from Simon, addressed to you, `--important`, questions and `BLOCKED:` still wake you at once. Only wait on
+what you don't need to act on promptly: reacting in time comes before saving wakes.
+
 ## When to subscribe (do it without being asked)
 
 Subscribe the moment you take ownership of something whose changes you'd need to react to:

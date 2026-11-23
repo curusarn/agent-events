@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS events (
   UNIQUE (topic, dedupe)
 );
 CREATE INDEX IF NOT EXISTS events_created ON events(created_at);
+CREATE TABLE IF NOT EXISTS wakes (  -- each time a subscription's events woke its agent
+  agent_id TEXT NOT NULL,
+  topic TEXT NOT NULL,       -- the subscription's topic
+  at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS wakes_agent ON wakes(agent_id, at);
 """
 
 # An event matches a subscription to its exact topic or any topic nested under it.
@@ -61,6 +67,37 @@ def is_quiet(event: dict) -> bool:
     """An FYI event (published with "quiet"): it never wakes the agent. It is handed over with
     the next events that do, or at the start of the agent's next turn."""
     return (event.get("data") or {}).get("quiet") in (True, 1, "1", "true")
+
+
+def is_held(event: dict) -> bool:
+    """Held back by the wait its agent set on the subscription (see Store.mark_held): it wakes the
+    agent once the wait is over, and goes along with anything that wakes it sooner."""
+    return bool(event.get("held_until"))
+
+
+def wakes_agent(event: dict) -> bool:
+    return not is_quiet(event) and not is_held(event)
+
+
+def is_urgent(event: dict) -> bool:
+    """What a wait never holds back: Hyperfocus flags posts from the operator, posts addressed to
+    the agent, --important ones, questions and blockers ("urgent" in data). Posts from an older
+    Hyperfocus carry no flag: from the operator (the actor says so) or BLOCKED: still count."""
+    data = event.get("data") or {}
+    if data.get("urgent") not in (None, "", False, 0, "0", "false"):
+        return True
+    if "human operator" in (event.get("actor") or ""):
+        return True
+    text = BRACKET_RE.sub("", event.get("summary") or "", count=1)
+    text = re.sub(r"^Forwarded by [^:]*:\s*", "", text)
+    return re.sub(r"^[^A-Za-z]*", "", text)[:7].lower() == "blocked"
+
+
+BRACKET_RE = re.compile(r"^\[[^\]]*\]\s*")
+
+
+def _matches(sub: str, topic: str) -> bool:
+    return topic == sub or topic.startswith(sub + "/")
 
 
 GITHUB_PR_RE = re.compile(r"^github/[^/]+/([^/]+)/(\d+)$")
@@ -112,8 +149,12 @@ class Store:
                 self.db.execute("PRAGMA foreign_keys=ON")
                 if "retired" not in {r[1] for r in self.db.execute("PRAGMA table_info(agents)")}:
                     self.db.execute("ALTER TABLE agents ADD COLUMN retired REAL")
-                if "filter" not in {r[1] for r in self.db.execute("PRAGMA table_info(subscriptions)")}:
-                    self.db.execute("ALTER TABLE subscriptions ADD COLUMN filter TEXT")
+                sub_cols = {r[1] for r in self.db.execute("PRAGMA table_info(subscriptions)")}
+                for col, typ in (("filter", "TEXT"), ("wait", "REAL"), ("nudged_at", "REAL")):
+                    if col not in sub_cols:
+                        self.db.execute(f"ALTER TABLE subscriptions ADD COLUMN {col} {typ}")
+                if "seen_at" not in {r[1] for r in self.db.execute("PRAGMA table_info(events)")}:
+                    self.db.execute("ALTER TABLE events ADD COLUMN seen_at REAL")  # when it reached us
                 self._rename_topics("mc/", "hf/")
 
     def _rename_topics(self, old: str, new: str) -> None:
@@ -170,6 +211,53 @@ class Store:
             if cur.rowcount == 0:
                 self.db.execute("UPDATE subscriptions SET filter = ? WHERE agent_id = ? AND topic = ?", (flt, agent, topic))
             return cur.rowcount == 1
+
+    def set_wait(self, agent: str, topic: str, seconds: float | None) -> bool:
+        """Hold the subscription's events back from waking the agent for `seconds` (None: no wait)."""
+        cur = self.x("UPDATE subscriptions SET wait = ? WHERE agent_id = ? AND topic = ?",
+                     (seconds if seconds and seconds > 0 else None, agent, topic))
+        return cur.rowcount == 1
+
+    def mark_held(self, agent: str, events: list[dict], now: float | None = None) -> list[dict]:
+        """Set "held_until" on each event a wait holds back: one that would wake the agent, isn't
+        urgent, and every subscription it came in by has a wait that hasn't passed since it arrived
+        (a subscription without one wants it now). Order and delivery are unchanged: a held event
+        still goes along with anything that wakes the agent, and wakes it itself when due."""
+        now = time.time() if now is None else now
+        subs = [s for s in self.subs(agent)]
+        if not any(s["wait"] for s in subs):
+            return events
+        for e in events:
+            e.pop("held_until", None)
+            if is_quiet(e) or is_urgent(e):
+                continue
+            waits = [s["wait"] for s in subs if e["id"] > s["since"] and _matches(s["topic"], e["topic"])]
+            if waits and all(waits):
+                due = (e.get("seen_at") or e["created_at"]) + min(waits)
+                if due > now:
+                    e["held_until"] = due
+        return events
+
+    def sub_of(self, subs: list, topic: str) -> str | None:
+        """The subscription an event's topic came in by (the most specific one)."""
+        found = [s["topic"] for s in subs if _matches(s["topic"], topic)]
+        return max(found, key=len) if found else None
+
+    def record_wake(self, agent: str, topics: list[str]) -> None:
+        now = time.time()
+        with self.lock:
+            for t in topics:
+                self.db.execute("INSERT INTO wakes (agent_id, topic, at) VALUES (?,?,?)", (agent, t, now))
+
+    def wake_counts(self, agent: str, since: float) -> dict[str, int]:
+        return {r[0]: r[1] for r in self.q("SELECT topic, COUNT(*) FROM wakes WHERE agent_id = ? AND at >= ? "
+                                           "GROUP BY topic", (agent, since))}
+
+    def nudged(self, agent: str, topic: str) -> None:
+        self.x("UPDATE subscriptions SET nudged_at = ? WHERE agent_id = ? AND topic = ?", (time.time(), agent, topic))
+
+    def prune_wakes(self, older_than: float) -> None:
+        self.x("DELETE FROM wakes WHERE at < ?", (older_than,))
 
     def remove_subs(self, agent: str, topics: list[str] | None) -> list[str]:
         """Remove the given topics (and anything nested under them), or all when None."""
@@ -238,9 +326,9 @@ class Store:
         """Insert one published event; returns its id, or None if (topic, dedupe) already exists."""
         with self.lock:
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO events (topic, kind, dedupe, summary, body, url, actor, data, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (e.topic, e.kind, e.dedupe, e.summary, e.body, e.url, e.actor, json.dumps(e.data), time.time()))
+                "INSERT OR IGNORE INTO events (topic, kind, dedupe, summary, body, url, actor, data, created_at, seen_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (e.topic, e.kind, e.dedupe, e.summary, e.body, e.url, e.actor, json.dumps(e.data), time.time(), time.time()))
             return cur.lastrowid if cur.rowcount == 1 else None
 
     def event_id(self, topic: str, dedupe: str) -> int | None:
@@ -251,10 +339,10 @@ class Store:
         n = 0
         for e in events:
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO events (topic, kind, dedupe, summary, body, url, actor, data, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO events (topic, kind, dedupe, summary, body, url, actor, data, created_at, seen_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (e.topic, e.kind, e.dedupe, e.summary, e.body, e.url, e.actor, json.dumps(e.data),
-                 min(getattr(e, "at", None) or now, now)))  # the source's time when it gives one
+                 min(getattr(e, "at", None) or now, now), now))  # the source's time when it gives one
             n += cur.rowcount
         return n
 
@@ -313,12 +401,15 @@ class Store:
     def wakes(self, seen_after: float, since: float = 0) -> dict[str, int]:
         """Agent -> pending comments flagged wakes_stopped_at, seen after `seen_after` and written
         after `since`. Like `unread`, not counting news older than what the agent already got. A
-        filtered subscription doesn't count: it asked for less than everything on its topic."""
+        filtered subscription doesn't count: it asked for less than everything on its topic. Nor does
+        one whose wait hasn't passed since the comment arrived."""
         rows = self.q(f"SELECT s.agent_id AS agent, e.id AS id, e.data AS data FROM events e "
                       f"CROSS JOIN subscriptions s JOIN agents a ON a.id = s.agent_id "
                       f"LEFT JOIN events c ON c.id = a.cursor "
                       f"WHERE e.data LIKE '%wakes_stopped_at%' AND {MATCH} AND e.id > s.since AND e.id > a.cursor "
-                      f"AND COALESCE(s.filter, '') = '' AND e.created_at >= MAX(?, COALESCE(c.created_at, 0))", (since,))
+                      f"AND COALESCE(s.filter, '') = '' AND e.created_at >= MAX(?, COALESCE(c.created_at, 0)) "
+                      f"AND COALESCE(e.seen_at, e.created_at) + COALESCE(s.wait, 0) <= ?",  # a wait holds it back
+                      (since, time.time()))
         found = {(r["agent"], r["id"]) for r in rows if json.loads(r["data"]).get("wakes_stopped_at", 0) >= seen_after}
         return dict(Counter(agent for agent, _ in found))
 

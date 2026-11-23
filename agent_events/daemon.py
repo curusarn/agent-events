@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import config
 from .locks import TimedRLock
 from .sources import SOURCES, Event, SourceError, TopicError, is_push, matches, parse, poll_key
-from .store import Store, is_quiet
+from .store import Store, is_urgent, wakes_agent
 
 # Events about the source itself, not about the thing watched.
 HEALTH_KINDS = ("error", "recovered")
@@ -41,6 +41,10 @@ WAKE_WINDOW = 24 * 3600
 ERROR_REPORT_AFTER = 3
 # The watchdog: the poller loop goes round every second, and no poll takes longer than an `op read`
 # Approve (340 s) plus its request. Past these, polling has stopped (2026-11-18: 16 hours unnoticed).
+# A subscription that woke its agent this often in the last hour, with events a wait would hold,
+# gets a note in the delivery offering a wait (at most once per NUDGE_EVERY).
+BUSY_WAKES = int(config._float_env("AGENT_EVENTS_BUSY_WAKES", 6))
+NUDGE_EVERY = config._float_env("AGENT_EVENTS_NUDGE_EVERY", 3600)
 STALL = config._float_env("AGENT_EVENTS_STALL", 180)  # the poller loop made no round for this long
 POLL_STALL = config._float_env("AGENT_EVENTS_POLL_STALL", 900)  # one poll has been running this long
 WATCHDOG_EVERY = config._float_env("AGENT_EVENTS_WATCHDOG_EVERY", 30)
@@ -354,6 +358,7 @@ class Daemon:
                 log(f"forgetting agent {a['id']} (inactive since {time.ctime(a['last_seen'])})")
                 self.store.delete_agent(a["id"])
         self.store.prune_events(now - config.EVENT_TTL)
+        self.store.prune_wakes(now - 86400)
         for source in SOURCES.values():
             n = source.requests_last_hour()
             if n:
@@ -398,6 +403,34 @@ class Daemon:
             e["target"] = t["summary"] if t else ""
         return events
 
+    def _pending(self, agent: str, limit: int = 100) -> list[dict]:
+        """The agent's pending events, with those its waits hold back marked (held_until)."""
+        return self.store.mark_held(agent, self.store.pending(agent, limit))
+
+    def _woke(self, agent: str, events: list[dict]) -> list[dict]:
+        """These events wake the agent now: count the wake against each subscription a wait could
+        have batched (an urgent event wakes it whatever the wait), and note a busy one."""
+        subs = self.store.subs(agent)
+        by_topic = {s["topic"]: s for s in subs}
+        waking = {}
+        for e in events:
+            sub = self.store.sub_of(subs, e["topic"])
+            if sub and by_topic[sub]["wait"]:
+                e["wait"] = by_topic[sub]["wait"]
+            if sub and wakes_agent(e) and not is_urgent(e) and not e.get("wait"):
+                waking.setdefault(sub, e)
+        if not waking:
+            return events
+        self.store.record_wake(agent, list(waking))
+        counts = self.store.wake_counts(agent, time.time() - 3600)
+        for sub, first in waking.items():
+            n = counts.get(sub, 0)
+            nudged = by_topic[sub]["nudged_at"] or 0
+            if n >= BUSY_WAKES and time.time() - nudged > NUDGE_EVERY:
+                first["busy"], first["busy_topic"] = n, sub
+                self.store.nudged(agent, sub)
+        return events
+
     def op_ping(self, req):
         return {"ok": True, "pid": os.getpid(), "started": self.started, "version": self.version}
 
@@ -409,6 +442,8 @@ class Daemon:
         if source.push:  # nothing to poll or validate remotely; events are published into it
             topic = "/".join([source.type] + parts)
             created = self.store.add_sub(agent, topic, flt)
+            if req.get("wait") is not None:
+                self.store.set_wait(agent, topic, float(req["wait"]))
             self.notify()
             log(f"{agent} subscribed to {topic}" if created else f"{agent} re-subscribed to {topic}")
             return {"ok": True, "topic": topic, "new": created, "summary": "", "detail": ""}
@@ -431,6 +466,8 @@ class Daemon:
         canonical, extra = source.resolve(parts, json.loads(target["state"]))
         topic = "/".join([source.type] + canonical)
         created = self.store.add_sub(agent, topic, flt)
+        if req.get("wait") is not None:
+            self.store.set_wait(agent, topic, float(req["wait"]))
         self.notify()
         log(f"{agent} subscribed to {topic}" if created else f"{agent} re-subscribed to {topic}")
         return {"ok": True, "topic": topic, "new": created, "summary": target["summary"], "detail": extra}
@@ -465,6 +502,34 @@ class Daemon:
         self.notify()
         return {"ok": True, "removed": removed}
 
+    def op_wait(self, req):
+        """Set (seconds > 0) or clear (0) the wait on one of the agent's subscriptions: its events
+        wake the agent together once the wait has passed since the first of them arrived."""
+        agent = self._agent(req)
+        raw = (req.get("topic") or "").strip()
+        seconds = float(req.get("seconds") or 0)
+        subs = [s["topic"] for s in self.store.subs(agent)]
+        topic = raw.strip("/")
+        try:
+            source, parts = parse(raw)
+            topic = "/".join([source.type] + parts)
+            if not source.push:
+                target = self.store.target(poll_key(source, parts))
+                if target and target["state"]:
+                    try:
+                        topic = "/".join([source.type] + source.resolve(parts, json.loads(target["state"]))[0])
+                    except TopicError:
+                        pass
+        except TopicError:
+            pass
+        if topic not in subs:
+            listed = "\n  ".join(subs) or "(none)"
+            raise TopicError(f"not subscribed to {topic}; your subscriptions:\n  {listed}")
+        self.store.set_wait(agent, topic, seconds)
+        self.notify()  # a shorter wait may make held events due now
+        log(f"{agent} set a {seconds:g}s wait on {topic}" if seconds > 0 else f"{agent} cleared the wait on {topic}")
+        return {"ok": True, "topic": topic, "wait": seconds if seconds > 0 else None}
+
     def op_transfer(self, req):
         """Hand one agent's subscriptions (with their filters) to another: a conversation that
         continues as a fresh one (Hyperfocus' clear context), or an agent's next phase. Push topics
@@ -481,6 +546,8 @@ class Daemon:
             except TopicError:
                 pass
             self.store.add_sub(new, s["topic"], json.loads(s["filter"]) if s["filter"] else None)
+            if s["wait"]:
+                self.store.set_wait(new, s["topic"], s["wait"])
             moved.append(s["topic"])
         if req.get("move") and moved:
             self.store.remove_subs(old, moved)
@@ -503,7 +570,7 @@ class Daemon:
             out.append({"topic": s["topic"], "since": s["created_at"], "push": push,
                         "summary": t["summary"] if t else None, "last_poll": t["last_poll"] if t else None,
                         "error": t["error"] if t else None,
-                        "filter": json.loads(s["filter"]) if s["filter"] else None})
+                        "filter": json.loads(s["filter"]) if s["filter"] else None, "wait": s["wait"]})
         with self.cond:
             watching = agent in self.watchers
         return {"ok": True, "agent": agent, "subscriptions": out, "watching": watching,
@@ -528,10 +595,12 @@ class Daemon:
             owner = self.watchers.get(agent)
             if agent in self.inflight_batches or (owner is not None and owner is not self.passive.get(agent)):
                 return {"ok": True, "events": []}
-            events = self._annotate(self.store.pending(agent))
-            if req.get("wake_only") and all(is_quiet(e) for e in events):
+            events = self._annotate(self._pending(agent))
+            if req.get("wake_only") and not any(wakes_agent(e) for e in events):
                 return {"ok": True, "events": []}
             if events and req.get("ack", True):
+                if req.get("wake_only"):
+                    self._woke(agent, events)
                 self.store.ack(agent, max(e["id"] for e in events))
         return {"ok": True, "events": events}
 
@@ -553,8 +622,8 @@ class Daemon:
             if want is not None and agent not in want:
                 continue
             floor = max(since, self.store.cursor_time(agent))
-            events = [e for e in self.store.pending(agent, limit=1000)
-                      if not is_quiet(e) and e["kind"] not in HEALTH_KINDS
+            events = [e for e in self._pending(agent, limit=1000)
+                      if wakes_agent(e) and e["kind"] not in HEALTH_KINDS
                       and not (exclude and e["topic"].startswith(exclude)) and e["created_at"] >= floor]
             if events:
                 out[agent] = {"count": len(events), "oldest": min(e["created_at"] for e in events),
@@ -722,9 +791,10 @@ class Daemon:
                 if not self.store.subs(agent):
                     handler.send({"ok": True, "events": [], "no_subscriptions": True})
                     return
-                pending = [] if standby else self.store.pending(agent)
-                # FYI events never wake the agent: they go along with the next ones that do.
-                if any(not is_quiet(e) for e in pending):
+                pending = [] if standby else self._pending(agent)
+                # FYI events never wake the agent: they go along with the next ones that do. Nor
+                # do events a wait holds back, until it is over.
+                if any(wakes_agent(e) for e in pending):
                     # Let a burst (e.g. a review with many comments) land. Published messages are
                     # already complete, so those only wait a moment.
                     push_only = all(is_push(e["topic"]) for e in pending)
@@ -732,12 +802,12 @@ class Daemon:
                     with self.cond:
                         if self.watchers.get(agent) is not token or agent in self.inflight_batches:
                             continue  # another watch owns delivery now, or is still delivering
-                        events = self.store.pending(agent)
-                        if all(is_quiet(e) for e in events):
+                        events = self._pending(agent)
+                        if not any(wakes_agent(e) for e in events):
                             continue  # taken by the hook in the meantime
                         self.inflight_batches.add(agent)
                     try:
-                        handler.send({"ok": True, "events": self._annotate(events)})
+                        handler.send({"ok": True, "events": self._woke(agent, self._annotate(events))})
                         ack = handler.read(timeout=120)
                         if ack and ack.get("ack"):
                             self.store.ack(agent, int(ack["ack"]))
@@ -753,9 +823,13 @@ class Daemon:
                 if time.time() - last_touch > 60:
                     self.store.touch_agent(agent)
                     last_touch = time.time()
+                # Wake up when the first event a wait holds back is due.
+                due = min((e["held_until"] for e in pending if e.get("held_until")), default=None)
                 with self.cond:
                     if self.generation == generation:
                         wait = 5.0 if deadline is None else max(0.0, min(5.0, deadline - time.time()))
+                        if due is not None:
+                            wait = max(0.02, min(wait, due - time.time()))
                         self.cond.wait(wait)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return

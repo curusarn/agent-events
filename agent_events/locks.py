@@ -58,6 +58,9 @@ class TimedRLock:
     def __exit__(self, *exc) -> None:
         self.release()
 
+    def locked(self) -> bool:  # Python 3.14+'s Condition reads it
+        return self._lock.locked()
+
     # What threading.Condition uses, so a Condition built on this lock waits the same way.
     def _is_owned(self) -> bool:
         return self._owner == threading.get_ident()

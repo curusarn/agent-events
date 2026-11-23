@@ -820,6 +820,134 @@ class QuietTests(CliTest):
         self.assertTrue(e["data"]["quiet"])
 
 
+class WaitTests(CliTest):
+    """An agent's wait on a busy subscription: its events wake the agent together once the wait has
+    passed since the first arrived; urgent posts still wake it at once; nothing is dropped or
+    reordered."""
+
+    SIMON = "Simon (the human operator, not an agent)"
+
+    def setUp(self):
+        super().setUp()
+        self.req(op="subscribe", agent="ag", topic="hf/agent/x")
+        self.req(op="subscribe", agent="ag", topic="hf/thread/t")
+
+    def publish(self, summary, topic="hf/agent/x", **kw):
+        return self.req(op="publish", topic=topic, summary=summary, **kw)
+
+    def test_held_events_wake_once_together_after_the_wait(self):
+        r = self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=1.5)
+        self.assertEqual((r["topic"], r["wait"]), ("hf/agent/x", 1.5))
+        self.assertEqual(self.req(op="list", agent="ag")["subscriptions"][0]["wait"], 1.5)
+        started = time.time()
+        for i in range(4):
+            self.publish(f"progress {i}")
+        self.publish("fyi", quiet=True)
+        resp = watch_raw("ag", timeout=8)
+        self.assertGreaterEqual(time.time() - started, 1.4, "a held event woke the watch early")
+        self.assertLess(time.time() - started, 4)
+        self.assertEqual([e["summary"] for e in resp["events"]], ["progress 0", "progress 1", "progress 2",
+                                                                  "progress 3", "fyi"])
+        self.assertTrue(all(e.get("wait") == 1.5 for e in resp["events"]))
+        self.assertIn("hf/agent/x  (batched by your 1s wait)", cli.format_events(resp["events"]))
+
+    def test_urgent_posts_wake_at_once_and_bring_the_held_ones_in_order(self):
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=60)
+        self.publish("progress")
+        self.publish("[thread title] BLOCKED: need a key")
+        resp = watch_raw("ag", timeout=3)
+        self.assertEqual([e["summary"] for e in resp["events"]], ["progress", "[thread title] BLOCKED: need a key"])
+        for urgent in ({"actor": self.SIMON}, {"data": {"urgent": "addressed"}}, {"data": {"urgent": "important"}}):
+            self.publish("held")
+            self.assertTrue(watch_raw("ag", timeout=0.5).get("timeout"))
+            self.publish("now", **urgent)
+            self.assertEqual([e["summary"] for e in watch_raw("ag", timeout=3)["events"]], ["held", "now"], urgent)
+
+    def test_other_subscriptions_still_wake_and_bring_held_events(self):
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=60)
+        self.publish("held")
+        self.publish("thread post", topic="hf/thread/t")
+        self.assertEqual([e["summary"] for e in watch_raw("ag", timeout=3)["events"]], ["held", "thread post"])
+
+    def test_stop_hook_and_unread_leave_held_events_alone(self):
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=60)
+        self.publish("held")
+        self.assertEqual(self.req(op="take", agent="ag", wake_only=True)["events"], [])
+        self.assertEqual(self.req(op="unread")["agents"], {})
+        # A turn that starts anyway (a prompt) gets them.
+        self.assertEqual([e["summary"] for e in self.req(op="take", agent="ag")["events"]], ["held"])
+
+    def test_clearing_the_wait_delivers_what_it_held(self):
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=60)
+        self.publish("held")
+        result = {}
+        t = threading.Thread(target=lambda: result.update(watch_raw("ag", timeout=8)))
+        t.start()
+        time.sleep(0.5)
+        self.assertTrue(t.is_alive())
+        self.req(op="wait", agent="ag", topic="hf/agent/x", seconds=0)
+        t.join(5)
+        self.assertEqual([e["summary"] for e in result["events"]], ["held"])
+
+    def test_polled_subscription_with_a_wait(self):
+        self.fake.things["a"] = {"version": 0, "events": []}
+        self.req(op="subscribe", agent="ag", topic="fake/a", wait=60)
+        self.fake.change("a", ("", "bot deploy"))
+        self.assertTrue(self.wait_for(lambda: self.daemon.store.pending("ag")))
+        self.assertTrue(watch_raw("ag", timeout=0.5).get("timeout"))
+        self.publish("wake")
+        self.assertEqual([e["summary"] for e in watch_raw("ag", timeout=3)["events"]], ["bot deploy", "wake"])
+
+    def test_busy_subscription_gets_a_note_once(self):
+        from agent_events import daemon
+        with mock.patch.object(daemon, "BUSY_WAKES", 3):
+            notes = []
+            for i in range(5):
+                self.publish(f"post {i}")
+                resp = watch_raw("ag", timeout=3)
+                notes.append(resp["events"][0].get("busy"))
+            self.assertEqual(notes, [None, None, 3, None, None])
+            text = cli.format_events([dict(resp["events"][0], busy=3, busy_topic="hf/agent/x")])
+            self.assertIn("hf/agent/x woke you 3 times in the last hour", text)
+            self.assertIn("`agent-events wait hf/agent/x 10m`", text)
+            self.assertIn("Reacting in time comes first", text)
+            self.assertNotIn("unsubscribe", text)  # never offered for the inbox
+            # Urgent posts don't count: a wait wouldn't hold them.
+            self.publish("from simon", actor=self.SIMON)
+            watch_raw("ag", timeout=3)
+            self.assertEqual(self.daemon.store.wake_counts("ag", 0), {"hf/agent/x": 5})
+
+    def test_note_for_a_polled_subscription_offers_narrowing(self):
+        text = cli.busy_note("slack/C123", 9)
+        self.assertIn("agent-events unsubscribe slack/C123", text)
+        self.assertIn("--about", text)
+        self.assertIn("Nothing is dropped", text)
+
+    def test_cli(self):
+        code, out = self.run_cli("--agent", "ag", "wait", "hf/agent/x", "10m")
+        self.assertEqual(code, 0)
+        self.assertIn("✓ hf/agent/x: its events now wake you together, 10m", out)
+        self.assertIn("wait 10m", self.run_cli("--agent", "ag", "list")[1])
+        self.assertIn("no wait", self.run_cli("--agent", "ag", "wait", "hf/agent/x", "off")[1])
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("--agent", "ag", "wait", "hf/agent/nope", "10m")
+        self.assertIn("not subscribed to hf/agent/nope", str(e.exception))
+        self.assertEqual([cli.parse_duration(x) for x in ("90s", "10m", "1h", "600", "off")], [90, 600, 3600, 600, 0])
+
+    def test_transfer_keeps_the_wait(self):
+        self.fake.things["a"] = {"version": 0, "events": []}
+        self.req(op="subscribe", agent="ag", topic="fake/a", wait=300)
+        self.req(op="transfer", **{"from": "ag", "to": "ag2"})
+        self.assertEqual(self.req(op="list", agent="ag2")["subscriptions"][0]["wait"], 300)
+
+    def test_is_urgent(self):
+        from agent_events.store import is_urgent
+        self.assertTrue(is_urgent({"summary": "Forwarded by orchestrator: BLOCKED: no key"}))
+        self.assertTrue(is_urgent({"summary": "**Blocked** on access"}))
+        self.assertFalse(is_urgent({"summary": "Not blocked any more", "data": {"urgent": "false"}}))
+        self.assertFalse(is_urgent({"summary": "deploy 123 done", "actor": "Julie"}))
+
+
 class FilterTests(DaemonTest):
     """A subscription with a filter (--about, --mine): only events mentioning those reach the
     agent, e.g. a busy deploy channel with just its own PRs."""

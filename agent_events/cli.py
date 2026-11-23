@@ -129,6 +129,40 @@ def event_header(e: dict, push: bool) -> str:
     return header
 
 
+def duration_text(seconds: float) -> str:
+    s = int(seconds)
+    if s % 3600 == 0:
+        return f"{s // 3600}h"
+    if s % 60 == 0:
+        return f"{s // 60}m"
+    return f"{s}s"
+
+
+def parse_duration(text: str) -> float:
+    """'10m', '90s', '1h', '600' (seconds); 'off' or '0' for none."""
+    t = text.strip().lower()
+    if t in ("off", "none", "0", "no"):
+        return 0.0
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|hr)?", t)
+    if not m:
+        raise ValueError(f"not a duration: {text!r} (e.g. 10m, 90s, 1h, off)")
+    return float(m.group(1)) * {"s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600, "hr": 3600}.get(m.group(2) or "s", 1)
+
+
+def busy_note(topic: str, wakes: int) -> str:
+    """Offered with the events when a subscription woke the agent often: being able to react
+    comes first, saving wakes second (Simon, 2026-11-23)."""
+    inbox = topic.startswith("hf/")
+    still = ("Posts from Simon, posts addressed to you, --important ones, questions and BLOCKED: still wake you "
+             "at once." if inbox else "Nothing is dropped: they all come, in order, when the wait is over.")
+    other = "" if inbox else (f" Or narrow it (`agent-events subscribe {topic} --about '<words>'` or `--mine`), or drop "
+                              f"it if you no longer need it (`agent-events unsubscribe {topic}`).")
+    return (f"⏱ {topic} woke you {wakes} times in the last hour. If what comes on it is mostly not something you must "
+            f"act on promptly, batch it: `agent-events wait {topic} 10m` wakes you once for everything from it in "
+            f"10 minutes. {still}{other} Reacting in time comes first: if you need to act on these as they come, "
+            f"keep it as it is. (`agent-events wait {topic} off` undoes a wait.)")
+
+
 def format_events(events: list[dict], title: bool = True) -> str:
     from .sources import is_push
     out = [f"{len(events)} new event{'s' if len(events) != 1 else ''}:"] if title else []
@@ -139,7 +173,9 @@ def format_events(events: list[dict], title: bool = True) -> str:
         if out:
             out.append("")
         target = evs[0].get("target") or ""
-        out.append(f"{topic}" + (f"  —  {target}" if target else ""))
+        wait = next((e["wait"] for e in evs if e.get("wait")), None)
+        out.append(f"{topic}" + (f"  —  {target}" if target else "")
+                   + (f"  (batched by your {duration_text(wait)} wait)" if wait else ""))
         push = is_push(topic)
         for e in evs:
             out.append(f"  {event_header(e, push)}")
@@ -149,6 +185,10 @@ def format_events(events: list[dict], title: bool = True) -> str:
                 out.append(textwrap.indent(clip(e["body"], *limits), "    "))
             if e.get("url") and e["url"] not in target:
                 out.append(f"    {e['url']}")
+        busy = next((e for e in evs if e.get("busy")), None)
+        if busy:
+            sub = busy.get("busy_topic") or topic
+            out.append(f"  {busy_note(sub, busy['busy'])}")
     return "\n".join(out)
 
 
@@ -160,7 +200,8 @@ def cmd_subscribe(args):
         try:
             flt = {"about": [t.strip() for a in (args.about or []) for t in a.split(",") if t.strip()],
                    "mine": bool(args.mine)}
-            resp = client.request(agent_req(args, "subscribe", topic=topic, filter=flt), timeout=180)
+            extra = {"wait": parse_duration(args.wait)} if args.wait else {}
+            resp = client.request(agent_req(args, "subscribe", topic=topic, filter=flt, **extra), timeout=180)
         except DaemonDown as e:
             sys.exit(f"agent-events: daemon unavailable: {e}")
         if not resp.get("ok"):
@@ -169,7 +210,7 @@ def cmd_subscribe(args):
             failed.append(topic)
             continue
         verb = "subscribed to" if resp["new"] else "already subscribed to"
-        print(f"✓ {verb} {resp['topic']}")
+        print(f"✓ {verb} {resp['topic']}" + (f" (wait {duration_text(extra['wait'])})" if extra.get("wait") else ""))
         for line in (resp.get("summary"), resp.get("detail")):
             if line:
                 print(f"    {line}")
@@ -200,6 +241,22 @@ def did_you_mean(topics: list[str], i: int) -> str:
     return ""
 
 
+def cmd_wait(args):
+    try:
+        seconds = parse_duration(args.duration)
+    except ValueError as e:
+        sys.exit(f"agent-events: {e}")
+    resp = call(agent_req(args, "wait", topic=args.topic, seconds=seconds))
+    if resp.get("wait"):
+        urgent = (" Posts from Simon, posts addressed to you, --important ones, questions and BLOCKED: still wake "
+                  "you at once." if resp["topic"].startswith("hf/") else "")
+        print(f"✓ {resp['topic']}: its events now wake you together, {duration_text(resp['wait'])} after the first "
+              f"of them arrives, in order (anything else that wakes you sooner brings them along).{urgent} "
+              f"Undo: agent-events wait {resp['topic']} off")
+    else:
+        print(f"✓ {resp['topic']}: no wait; each of its events wakes you as it comes")
+
+
 def cmd_unsubscribe(args):
     if not args.topics and not args.all:
         sys.exit("agent-events: give topics to unsubscribe from, or --all")
@@ -228,7 +285,8 @@ def cmd_list(args):
         watch = "NOT running — start `agent-events watch` in the background"
     print(f"Watch: {watch}" + (f"; {resp['pending']} event(s) waiting" if resp["pending"] else ""))
     for s in subs:
-        print(f"\n  {s['topic']}  (since {ago(s['since'])})")
+        print(f"\n  {s['topic']}  (since {ago(s['since'])})"
+              + (f"  wait {duration_text(s['wait'])}: its events wake you together" if s.get("wait") else ""))
         if s.get("push"):
             print("    push topic (events are published into it, not polled)")
             continue
@@ -753,6 +811,14 @@ def main(argv=None) -> int:
                          "first message does. Subscribing again without it delivers everything again")
     sp.add_argument("--mine", action="store_true",
                     help="only events mentioning the PRs this agent is subscribed to (repo#N, pull/N, #N)")
+    sp.add_argument("--wait", metavar="DURATION",
+                    help="batch this subscription: its events wake you together this long after the first arrives "
+                         "(e.g. 10m; urgent posts still wake you at once). See `agent-events wait`")
+    sp = add("wait", cmd_wait, "batch a busy subscription: its events wake you together after a wait")
+    sp.add_argument("topic", metavar="TOPIC", help="one of your subscriptions (agent-events list)")
+    sp.add_argument("duration", metavar="DURATION",
+                    help="e.g. 10m, 90s, 1h; 'off' wakes you for each event again. Posts from Simon, addressed "
+                         "to you, --important, questions and BLOCKED: are never held")
     sp = add("unsubscribe", cmd_unsubscribe, "remove subscriptions (nested ones too)", ["unsub"])
     sp.add_argument("topics", nargs="*", metavar="TOPIC")
     sp.add_argument("--all", action="store_true", help="remove every subscription of this agent")
