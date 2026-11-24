@@ -87,12 +87,22 @@ class WatchdogTests(DaemonTest):
             self.assertTrue(self.wait_for(lambda: "is still running after" in (self.daemon.store.target("fake/b")["error"] or ""),
                                           timeout=5))
 
+    def test_sleep_is_not_a_hang(self):
+        # The Mac slept for an hour with a poll in flight: the wall clock moved on, awake time didn't.
+        self.daemon.inflight["fake/slept"] = time.monotonic()
+        real = time.time
+        with mock.patch("time.time", lambda: real() + 3600):
+            self.assertIsNone(self.daemon.check_stall())
+        self.assertIn("fake/slept", self.daemon.inflight)
+        self.daemon.inflight["fake/slept"] = time.monotonic() - daemon.POLL_STALL - 1
+        self.assertIn("1 poll(s) running", self.daemon.check_stall())
+
     def test_one_post_an_hour(self):
-        self.daemon.poller_beat = time.time() - 60
+        self.daemon.poller_beat = time.monotonic() - 60
         self.assertIsNotNone(self.daemon.check_stall())
         self.assertTrue(self.wait_for(lambda: self.alert(), timeout=5))
         os.remove(self.alert_file)
-        self.daemon.poller_beat = time.time() - 60
+        self.daemon.poller_beat = time.monotonic() - 60
         self.assertIsNotNone(self.daemon.check_stall())
         time.sleep(0.5)
         self.assertEqual(self.alert(), "")

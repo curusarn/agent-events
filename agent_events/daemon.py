@@ -90,7 +90,11 @@ class Daemon:
         self.passive: dict[str, object] = {}  # agent -> token of its newest passive (hook) watch
         self.inflight_batches: set[str] = set()  # agents with a batch sent to a watch but not yet acked
         self.key_locks: dict[str, TimedRLock] = defaultdict(TimedRLock)
-        self.inflight: dict[str, float] = {}  # poll key -> when its poll was handed to a worker
+        # Poll ages and the poller's beat are measured in awake time (time.monotonic(), which stops
+        # while the machine sleeps, as socket timeouts do): on the wall clock, a poll in flight when
+        # the Mac's lid closed looked hung for the whole sleep, and woke the watchdog on every wake
+        # (4 false "polling stopped" alerts in 24 h, 2026-11-23/24).
+        self.inflight: dict[str, float] = {}  # poll key -> when (awake time) its poll was handed to a worker
         self.inflight_lock = TimedRLock()
         self.stop = threading.Event()
         self.started = time.time()
@@ -98,7 +102,7 @@ class Daemon:
         self.last_active: set[str] = set()  # poll keys found active by the last poller pass
         self.holds_logged: dict[str, float] = {}  # source -> the hold last logged
         self.poller_gen = 0  # the poller thread whose generation this is runs; an older one quits
-        self.poller_beat = time.time()  # when the poller loop last went round
+        self.poller_beat = time.monotonic()  # when (awake time) the poller loop last went round
         self.stalls: list[float] = []  # when the watchdog found polling stopped
         self.last_alert = 0.0
 
@@ -248,14 +252,14 @@ class Daemon:
                     due = sorted(set(due) | set(healthy))
                 for i in range(0, len(due), size):
                     batches.append(due[i:i + size])
-                    self.inflight.update(dict.fromkeys(due[i:i + size], now))
+                    self.inflight.update(dict.fromkeys(due[i:i + size], time.monotonic()))
         return batches
 
     def start_poller(self) -> None:
         """Start a poller thread, with its own pool of poll workers. A poller started before it quits
         when it next goes round, so a stuck one that wakes up again doesn't poll twice."""
         self.poller_gen += 1
-        self.poller_beat = time.time()
+        self.poller_beat = time.monotonic()
         threading.Thread(target=self.poller, args=(self.poller_gen,), name=f"poller-{self.poller_gen}",
                          daemon=True).start()
 
@@ -264,7 +268,7 @@ class Daemon:
         pool = ThreadPoolExecutor(max_workers=4)
         last_maintenance = 0.0
         while not self.stop.is_set() and gen == self.poller_gen:
-            self.poller_beat = time.time()
+            self.poller_beat = time.monotonic()
             try:
                 config.load_env_file()
                 now = time.time()
@@ -294,11 +298,12 @@ class Daemon:
         restarted: a new process reads its tokens again, and 1Password refuses that while the operator
         is away or the Mac is locked. Returns what stalled, or None."""
         now = time.time()
-        silent = now - self.poller_beat
+        awake = time.monotonic()
+        silent = awake - self.poller_beat
         stuck = []
         if self.inflight_lock.acquire(timeout=10):  # the watchdog itself must never hang on a lock
             try:
-                stuck = sorted(k for k, t in self.inflight.items() if now - t > POLL_STALL)
+                stuck = sorted(k for k, t in self.inflight.items() if awake - t > POLL_STALL)
                 for k in stuck:
                     self.inflight.pop(k, None)  # due again; the new poller's polls of it wait KEY_WAIT at most
             finally:
@@ -307,7 +312,7 @@ class Daemon:
             return None
         if silent > STALL:
             what = (f"the poller loop made no round for {duration(silent)} "
-                    f"(since {time.strftime('%H:%M', time.localtime(self.poller_beat))})")
+                    f"(since {time.strftime('%H:%M', time.localtime(now - silent))})")
         else:
             what = (f"{len(stuck)} poll(s) running for over {duration(POLL_STALL)} "
                     f"({', '.join(stuck[:3])}{', …' if len(stuck) > 3 else ''})")
